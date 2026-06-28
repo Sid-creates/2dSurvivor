@@ -1,7 +1,12 @@
 import { useEffect, useState } from "react";
 import { bridge } from "../bridge/GameBridge";
 import type { Snapshot } from "../shared/types";
-import { BOX_OPEN_RANGE, BOSS_BASE_HP, BOSS_HP_PER_TIER } from "../shared/config";
+import {
+  BOX_OPEN_RANGE,
+  BOSS_BASE_HP,
+  BOSS_HP_PER_TIER,
+  DASH_COOLDOWN,
+} from "../shared/config";
 
 // In-game HUD overlay. Reads snapshots from the bridge and renders HP, mana,
 // wave timer, boss timer, swap charge meters. Positioned absolutely over the
@@ -117,6 +122,9 @@ export function Hud() {
             </div>
           </div>
         )}
+
+        {/* Controls panel (under the timer) */}
+        <ControlsPanel />
       </div>
 
       {/* Bottom left: player 1 stats */}
@@ -150,9 +158,14 @@ interface PlayerStat {
   maxHp: number;
   mana: number;
   maxMana: number;
+  shieldHp: number;
+  maxShield: number;
   charging: boolean;
   chargeProgress: number;
   iFrames: number;
+  dashCooldown: number;
+  dashTime: number;
+  dps: number;
   downed: boolean;
   color: number;
 }
@@ -168,6 +181,9 @@ function PlayerStatBlock({
 }) {
   const hpFrac = Math.max(0, player.hp / player.maxHp);
   const manaFrac = Math.max(0, player.mana / player.maxMana);
+  const shieldFrac = player.maxShield > 0 ? Math.max(0, player.shieldHp / player.maxShield) : 0;
+  const dashFrac = Math.max(0, 1 - player.dashCooldown / DASH_COOLDOWN);
+  const dashReady = player.dashCooldown <= 0;
   const colorHex = `#${player.color.toString(16).padStart(6, "0")}`;
 
   return (
@@ -182,16 +198,21 @@ function PlayerStatBlock({
         <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--color-text-faint)]">
           {label}
         </span>
-        {player.downed && (
-          <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--color-danger)]">
-            Downed
+        <div className="flex items-center gap-2">
+          <span className="font-mono text-[10px] tabular-nums text-[var(--color-text-muted)]">
+            {Math.round(player.dps)} dps
           </span>
-        )}
-        {player.iFrames > 0 && !player.downed && (
-          <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--color-accent-bright)]">
-            i-frames
-          </span>
-        )}
+          {player.downed && (
+            <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--color-danger)]">
+              Downed
+            </span>
+          )}
+          {player.iFrames > 0 && !player.downed && (
+            <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--color-accent-bright)]">
+              i-frames
+            </span>
+          )}
+        </div>
       </div>
 
       <div className="mt-2 flex items-center gap-2">
@@ -211,6 +232,17 @@ function PlayerStatBlock({
         </span>
       </div>
 
+      {/* Shield (absorb) bar */}
+      <div className="mt-1 flex items-center gap-2">
+        <span className="inline-block h-2 w-2 rounded-full bg-[#7dd3fc]" />
+        <div className="flex-1">
+          <Bar value={shieldFrac} color="#7dd3fc" trackColor="var(--color-base)" height={4} />
+        </div>
+        <span className="font-mono text-[10px] tabular-nums text-[var(--color-text-muted)]">
+          {Math.ceil(player.shieldHp)}
+        </span>
+      </div>
+
       <div className="mt-1.5 flex items-center gap-2">
         <span className="inline-block h-2 w-2" />
         <div className="flex-1">
@@ -225,6 +257,49 @@ function PlayerStatBlock({
           {Math.ceil(player.mana)}
         </span>
       </div>
+
+      {/* Dash cooldown meter */}
+      <div className="mt-1.5 flex items-center gap-2">
+        <span
+          className={`inline-block h-2 w-2 ${
+            dashReady ? "rounded-full bg-[var(--color-accent-bright)]" : "bg-[var(--color-text-faint)]"
+          }`}
+        />
+        <div className="flex-1">
+          <Bar
+            value={dashFrac}
+            color={dashReady ? "var(--color-accent-bright)" : "var(--color-text-faint)"}
+            trackColor="var(--color-base)"
+            height={3}
+          />
+        </div>
+        <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--color-text-faint)]">
+          {dashReady ? "Dash" : `${player.dashCooldown.toFixed(1)}s`}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function ControlsPanel() {
+  const rows: Array<[string, string]> = [
+    ["WASD", "Move"],
+    ["Shift", "Dash"],
+    ["Space", "Charge Swap"],
+    ["E", "Open Box"],
+  ];
+  return (
+    <div className="mt-2 flex items-center gap-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)]/80 px-3 py-1.5 backdrop-blur-md">
+      {rows.map(([key, action]) => (
+        <div key={key} className="flex items-center gap-1.5">
+          <span className="rounded border border-[var(--color-border-strong)] bg-[var(--color-surface-elevated)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--color-text)]">
+            {key}
+          </span>
+          <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--color-text-muted)]">
+            {action}
+          </span>
+        </div>
+      ))}
     </div>
   );
 }

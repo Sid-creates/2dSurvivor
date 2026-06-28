@@ -8,3 +8,6 @@ dist-ssr
 .DS_Store
 *.tsbuildinfo
 .vercel
+.cf-token.tmp
+.commit-msg.tmp
+.partykit/

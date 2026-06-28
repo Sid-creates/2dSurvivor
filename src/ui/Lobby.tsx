@@ -12,8 +12,7 @@ type LobbyPhase = "choose" | "hosting" | "joining" | "connected";
 
 export function Lobby({ onHost, onJoin }: LobbyProps) {
   const [phase, setPhase] = useState<LobbyPhase>("choose");
-  const [localPeerId, setLocalPeerId] = useState<string | null>(null);
-  const [remotePeerId, setRemotePeerId] = useState<string | null>(null);
+  const [roomCode, setRoomCode] = useState<string | null>(null);
   const [joinPeerId, setJoinPeerId] = useState("");
   const [connState, setConnState] = useState<ConnectionState>("idle");
   const [connMessage, setConnMessage] = useState<string | undefined>();
@@ -24,16 +23,10 @@ export function Lobby({ onHost, onJoin }: LobbyProps) {
       setConnMessage(e.message);
       if (e.state === "connected") setPhase("connected");
     });
-    const offLocal = bridge.on("localPeerId", (e) => {
-      setLocalPeerId(e.peerId);
-    });
-    const offLobby = bridge.on("lobby", (e) => {
-      setRemotePeerId(e.guestPeerId);
-    });
+    const offRoom = bridge.on("roomCode", (e) => setRoomCode(e.code));
     return () => {
       offConn();
-      offLocal();
-      offLobby();
+      offRoom();
     };
   }, []);
 
@@ -61,7 +54,7 @@ export function Lobby({ onHost, onJoin }: LobbyProps) {
             Co-op survivor-like
           </p>
           <p className="mt-1 text-sm text-[var(--color-text-muted)]">
-            Peer-to-peer. Two players. One swap.
+            Server-hosted. Two players. One swap.
           </p>
         </header>
 
@@ -122,17 +115,19 @@ export function Lobby({ onHost, onJoin }: LobbyProps) {
                 {phase === "hosting" ? "Hosting" : "Joining"}
               </p>
 
-              {localPeerId && (
+              {roomCode && (
                 <div className="mt-4">
                   <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--color-text-faint)]">
-                    Your room code
+                    {phase === "hosting" ? "Your room code" : "Joining room"}
                   </p>
                   <p className="mt-1 text-center font-mono text-2xl tracking-[0.4em] text-[var(--color-text)]">
-                    {localPeerId}
+                    {roomCode}
                   </p>
-                  <p className="mt-2 text-center text-[10px] text-[var(--color-text-faint)]">
-                    Share this code with your friend
-                  </p>
+                  {phase === "hosting" && (
+                    <p className="mt-2 text-center text-[10px] text-[var(--color-text-faint)]">
+                      Share this code with your friend
+                    </p>
+                  )}
                 </div>
               )}
 
@@ -156,11 +151,6 @@ export function Lobby({ onHost, onJoin }: LobbyProps) {
               <p className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--color-success)]">
                 Connected
               </p>
-              {remotePeerId && (
-                <p className="mt-3 break-all font-mono text-xs text-[var(--color-text-muted)]">
-                  Linked to {remotePeerId}
-                </p>
-              )}
               <p className="mt-4 text-xs text-[var(--color-text-muted)]">
                 Spawning into the world
               </p>

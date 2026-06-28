@@ -33,12 +33,21 @@ export interface PlayerState {
   maxHp: number;
   mana: number;
   maxMana: number;
+  /** Absorb-only HP layer; damage hits this before real HP. Phase B: Shield. */
+  shieldHp: number;
+  maxShield: number;
   /** Whether this player is currently charging a Swap. See CONTEXT.md: Charge. */
   charging: boolean;
   /** Charge progress 0..1. Swap fires when both players reach 1. */
   chargeProgress: number;
   /** Swap invulnerability frames remaining in seconds. See CONTEXT.md: i-frames. */
   iFrames: number;
+  /** Dash cooldown remaining in seconds. 0 = ready. Phase B: Dash. */
+  dashCooldown: number;
+  /** Dash burst time remaining in seconds. >0 means currently dashing. */
+  dashTime: number;
+  /** Rolling DPS for this player over DPS_WINDOW_SECONDS. Phase B: DPS meter. */
+  dps: number;
   /** True when HP reached 0; cannot act or be Swap-targeted. See CONTEXT.md: Downed. */
   downed: boolean;
   /** Downed-state revive progress 0..1; partner must be in proximity to fill. */
@@ -95,6 +104,29 @@ export interface ZoneState {
   color: number;
 }
 
+/** A static obstacle placed on the field each wave. Phase B: obstacle field. */
+export interface ObstacleState {
+  id: number;
+  /** "block" pushes entities out; "hazard" deals damage like a zone. */
+  kind: "block" | "hazard";
+  /** "rect" uses w/h; "circle" uses radius. */
+  shape: "rect" | "circle";
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  radius: number;
+  color: number;
+}
+
+/** A walk-over pickup. Phase B: health packs. */
+export interface PickupState {
+  id: number;
+  x: number;
+  y: number;
+  kind: "health";
+}
+
 /** A Box (loot container) present in the world. See CONTEXT.md: Box. */
 export interface BoxState {
   id: number;
@@ -112,8 +144,10 @@ export interface WeaponPickOption {
   kind: import("../sim/weapons").WeaponKind;
   /** If this option upgrades an existing weapon, its index in the loadout. -1 if new. */
   upgradeIndex: number;
-  /** The resulting level after picking (1 if new, current+1 if upgrade). */
+  /** The resulting level after picking (1 if new, current+1 if upgrade). 0 = heal sentinel. */
   resultingLevel: number;
+  /** If set, this option grants shield instead of a weapon. Phase B: defensive item. */
+  shield?: number;
 }
 
 export type RunStatus = "playing" | "won" | "lost";
@@ -127,6 +161,8 @@ export interface Snapshot {
   projectiles: ProjectileState[];
   boxes: BoxState[];
   zones: ZoneState[];
+  obstacles: ObstacleState[];
+  pickups: PickupState[];
   wave: number;
   waveTimer: number;
   isBossWave: boolean;
@@ -143,6 +179,8 @@ export interface PlayerInput {
   my: number;
   /** True while the Swap button is held. */
   charging: boolean;
+  /** True on the frame the dash button was pressed (edge-triggered). */
+  dashPressed: boolean;
 }
 
 /** Tagged union for every network message. Used by both Host and Guest. */

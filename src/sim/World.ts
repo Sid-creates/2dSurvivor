@@ -10,6 +10,8 @@ import type {
   ProjectileState,
   BoxState,
   ZoneState,
+  ObstacleState,
+  PickupState,
   Snapshot,
   PlayerInput,
   WeaponPickOption,
@@ -79,6 +81,25 @@ import {
   REVIVE_DURATION,
   ORBIT_RADIUS,
   ORBIT_ANGULAR_SPEED,
+  DASH_SPEED,
+  DASH_DURATION,
+  DASH_COOLDOWN,
+  DASH_I_FRAMES,
+  PLAYER_MAX_SHIELD,
+  SHIELD_PER_PICKUP,
+  OBSTACLE_BLOCK_COLOR,
+  OBSTACLE_HAZARD_COLOR,
+  OBSTACLE_HAZARD_DPS,
+  OBSTACLE_BLOCK_MARGIN,
+  OBSTACLE_COUNT_BASE,
+  OBSTACLE_HAZARD_CHANCE,
+  HEALTH_PACK_HEAL,
+  HEALTH_PACK_SPAWN_INTERVAL,
+  HEALTH_PACK_RADIUS,
+  HEALTH_PACK_COLOR,
+  HEALTH_PACK_DROP_CHANCE,
+  HEALTH_PACK_PICKUP_RANGE,
+  DPS_WINDOW_SECONDS,
 } from "../shared/config";
 
 interface InternalWeapon {
@@ -95,6 +116,14 @@ interface InternalPlayer extends PlayerState {
   /** Pending interaction request (press E on a box). */
   pendingOpenBoxId: number | null;
   reviveProgress: number;
+  /** Last non-zero movement direction, used to orient a dash with no input. */
+  facingX: number;
+  facingY: number;
+  /** Rolling DPS samples: [time, damage] pairs within DPS_WINDOW_SECONDS. */
+  damageLog: Array<[number, number]>;
+  /** Accumulated damage within the rolling window since last DPS recompute. */
+  damageAccum: number;
+  damageWindowStart: number;
 }
 
 interface InternalEnemy extends EnemyState {
@@ -135,10 +164,31 @@ interface InternalBox {
   options: WeaponPickOption[] | null;
 }
 
+interface InternalObstacle {
+  id: number;
+  kind: "block" | "hazard";
+  shape: "rect" | "circle";
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  radius: number;
+  color: number;
+}
+
+interface InternalPickup {
+  id: number;
+  x: number;
+  y: number;
+  kind: "health";
+}
+
 let nextEnemyId = 1;
 let nextProjectileId = 1;
 let nextBoxId = 1;
 let nextZoneId = 1;
+let nextObstacleId = 1;
+let nextPickupId = 1;
 
 function makePlayer(id: string, color: number, x: number, y: number): InternalPlayer {
   return {
@@ -151,21 +201,32 @@ function makePlayer(id: string, color: number, x: number, y: number): InternalPl
     maxHp: PLAYER_MAX_HP,
     mana: PLAYER_MAX_MANA,
     maxMana: PLAYER_MAX_MANA,
+    shieldHp: 0,
+    maxShield: PLAYER_MAX_SHIELD,
     charging: false,
     chargeProgress: 0,
     iFrames: 0,
+    dashCooldown: 0,
+    dashTime: 0,
+    dps: 0,
     downed: false,
     reviveProgress: 0,
     color,
-    bufferedInput: { mx: 0, my: 0, charging: false },
+    bufferedInput: { mx: 0, my: 0, charging: false, dashPressed: false },
     weapons: [{ kind: "pulse", level: 1, cooldown: 0, orbitPhase: 0 }],
     pendingOpenBoxId: null,
+    facingX: 1,
+    facingY: 0,
+    damageLog: [],
+    damageAccum: 0,
+    damageWindowStart: 0,
   };
 }
 
 function damageFor(w: InternalWeapon): number {
   const def = WEAPON_DEFS[w.kind];
-  return def.baseDamage * (1 + (w.level - 1) * 0.35);
+  // Tuned down (Phase B): 0.25 per level instead of 0.35 so kills take longer.
+  return def.baseDamage * (1 + (w.level - 1) * 0.25);
 }
 
 function intervalFor(w: InternalWeapon): number {
@@ -184,6 +245,8 @@ export class World {
   private projectiles: Map<number, InternalProjectile> = new Map();
   private boxes: Map<number, InternalBox> = new Map();
   private zones: Map<number, InternalZone> = new Map();
+  private obstacles: Map<number, InternalObstacle> = new Map();
+  private pickups: Map<number, InternalPickup> = new Map();
   private tick = 0;
   private time = 0;
   private wave = 1;
@@ -191,6 +254,7 @@ export class World {
   private isBossWave = false;
   private bossTimer = 0;
   private enemySpawnCooldown = ENEMY_SPAWN_INTERVAL;
+  private healthPackCooldown = HEALTH_PACK_SPAWN_INTERVAL;
   private runStatus: RunStatus = "playing";
 
   addHostPlayer(id: string): void {
@@ -221,6 +285,53 @@ export class World {
 
   setLocalInput(id: string, input: PlayerInput): void {
     this.setPlayerInput(id, input);
+  }
+
+  /** Shield absorbs first; remainder hits HP. Centralizes the downed transition. */
+  private applyDamage(p: InternalPlayer, amount: number): void {
+    if (p.iFrames > 0 || p.downed) return;
+    let remaining = amount;
+    if (p.shieldHp > 0) {
+      const absorbed = Math.min(p.shieldHp, remaining);
+      p.shieldHp -= absorbed;
+      remaining -= absorbed;
+    }
+    if (remaining > 0) {
+      p.hp -= remaining;
+      if (p.hp <= 0) {
+        p.hp = 0;
+        p.downed = true;
+        p.bufferedInput = { mx: 0, my: 0, charging: false, dashPressed: false };
+        p.chargeProgress = 0;
+        p.charging = false;
+        p.dashTime = 0;
+      }
+    }
+  }
+
+  /** Attribute outgoing damage to a player for the DPS meter. */
+  private recordDamage(ownerId: string, amount: number): void {
+    const p = this.players.get(ownerId);
+    if (!p) return;
+    p.damageAccum += amount;
+    p.damageLog.push([this.time, amount]);
+  }
+
+  /** Recompute each player's rolling-window DPS, pruning stale samples. */
+  private updateDps(): void {
+    const cutoff = this.time - DPS_WINDOW_SECONDS;
+    for (const p of this.players.values()) {
+      if (p.damageLog.length > 0) {
+        // Drop samples older than the window.
+        while (p.damageLog.length > 0 && p.damageLog[0][0] < cutoff) {
+          p.damageLog.shift();
+        }
+      }
+      let sum = 0;
+      for (const [, dmg] of p.damageLog) sum += dmg;
+      p.dps = sum / DPS_WINDOW_SECONDS;
+      p.damageAccum = 0;
+    }
   }
 
   /** Mark that a player wants to open the nearest box this frame. */
@@ -271,6 +382,16 @@ export class World {
     // Heal sentinel (resultingLevel === 0): restore HP and close the box.
     if (option.resultingLevel === 0) {
       player.hp = Math.min(player.maxHp, player.hp + player.maxHp * 0.3);
+      box.opened = true;
+      box.options = null;
+      box.openerId = null;
+      this.boxes.delete(boxId);
+      return;
+    }
+
+    // Shield defensive item (option.shield set): top up the absorb layer.
+    if (option.shield !== undefined) {
+      player.shieldHp = Math.min(player.maxShield, player.shieldHp + option.shield);
       box.opened = true;
       box.options = null;
       box.openerId = null;
@@ -343,9 +464,20 @@ export class World {
         }
       }
 
+      // Defensive option: a shield top-up. Offered sometimes so it competes with
+      // weapons but doesn't dominate. Only meaningful while below max shield.
+      if (player.shieldHp < player.maxShield && Math.random() < 0.45) {
+        candidates.push({
+          kind: "pulse", // placeholder kind; `shield` flag makes the client render it as a shield
+          upgradeIndex: -1,
+          resultingLevel: -1, // -1 = shield sentinel (distinct from 0 = heal, >=1 = weapon)
+          shield: SHIELD_PER_PICKUP,
+        });
+      }
+
       if (candidates.length === 0) break;
       const pick = candidates[Math.floor(Math.random() * candidates.length)];
-      usedKinds.add(pick.kind);
+      if (pick.shield === undefined) usedKinds.add(pick.kind);
       options.push(pick);
     }
 
@@ -397,8 +529,11 @@ export class World {
     this.updateEnemies(dt);
     this.updateProjectiles(dt);
     this.updateZones(dt);
+    this.updateObstacles(dt);
+    this.updatePickups(dt);
     this.resolveCombat(dt);
     this.updateRevive(dt);
+    this.updateDps();
     this.checkLossCondition();
   }
 
@@ -427,6 +562,160 @@ export class World {
       this.bossTimer = 30;
       this.spawnBoss();
     }
+    // Per-wave obstacle field: clear the old layout and generate a fresh one.
+    this.obstacles.clear();
+    if (!this.isBossWave) {
+      this.generateObstacles(this.wave);
+    }
+  }
+
+  /** Seed an obstacle layout for the wave. Deterministic-ish variety per wave. */
+  private generateObstacles(wave: number): void {
+    const count = OBSTACLE_COUNT_BASE + Math.floor(wave / 3);
+    const margin = OBSTACLE_BLOCK_MARGIN;
+    const minX = margin;
+    const maxX = WORLD_WIDTH - margin;
+    const minY = margin;
+    const maxY = WORLD_HEIGHT - margin;
+    // Seeded RNG so a wave looks the same to both clients within a run, but
+    // varies across waves. (Host is authoritative; this just shapes the layout.)
+    let seed = wave * 2654435761;
+    const rand = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+    for (let i = 0; i < count; i++) {
+      const isHazard = rand() < OBSTACLE_HAZARD_CHANCE;
+      const shape: "rect" | "circle" = rand() < 0.5 ? "rect" : "circle";
+      const id = nextObstacleId++;
+      if (shape === "circle") {
+        const radius = 26 + rand() * 30;
+        this.obstacles.set(id, {
+          id,
+          kind: isHazard ? "hazard" : "block",
+          shape,
+          x: minX + rand() * (maxX - minX),
+          y: minY + rand() * (maxY - minY),
+          w: 0,
+          h: 0,
+          radius,
+          color: isHazard ? OBSTACLE_HAZARD_COLOR : OBSTACLE_BLOCK_COLOR,
+        });
+      } else {
+        const w = 40 + rand() * 70;
+        const h = 40 + rand() * 70;
+        this.obstacles.set(id, {
+          id,
+          kind: isHazard ? "hazard" : "block",
+          shape,
+          x: minX + rand() * (maxX - minX),
+          y: minY + rand() * (maxY - minY),
+          w,
+          h,
+          radius: 0,
+          color: isHazard ? OBSTACLE_HAZARD_COLOR : OBSTACLE_BLOCK_COLOR,
+        });
+      }
+    }
+  }
+
+  /** Push a circle (player/enemy) out of a rect/circle obstacle. Returns true if it collided. */
+  private collideObstacle(
+    x: number,
+    y: number,
+    r: number,
+  ): { x: number; y: number; hit: InternalObstacle | null } {
+    let nx = x;
+    let ny = y;
+    let hit: InternalObstacle | null = null;
+    for (const ob of this.obstacles.values()) {
+      if (ob.kind !== "block") continue;
+      if (ob.shape === "circle") {
+        const dx = nx - ob.x;
+        const dy = ny - ob.y;
+        const minDist = r + ob.radius;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < minDist * minDist && d2 > 0) {
+          const d = Math.sqrt(d2);
+          nx = ob.x + (dx / d) * minDist;
+          ny = ob.y + (dy / d) * minDist;
+          hit = ob;
+        }
+      } else {
+        // Closest point on rect to the circle center.
+        const cx = Math.max(ob.x, Math.min(nx, ob.x + ob.w));
+        const cy = Math.max(ob.y, Math.min(ny, ob.y + ob.h));
+        const dx = nx - cx;
+        const dy = ny - cy;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < r * r) {
+          if (d2 > 0) {
+            const d = Math.sqrt(d2);
+            nx = cx + (dx / d) * r;
+            ny = cy + (dy / d) * r;
+          } else {
+            // Center inside the rect: push out along the smallest penetration axis.
+            const left = nx - ob.x;
+            const right = ob.x + ob.w - nx;
+            const top = ny - ob.y;
+            const bottom = ob.y + ob.h - ny;
+            const m = Math.min(left, right, top, bottom);
+            if (m === left) nx = ob.x - r;
+            else if (m === right) nx = ob.x + ob.w + r;
+            else if (m === top) ny = ob.y - r;
+            else ny = ob.y + ob.h + r;
+          }
+          hit = ob;
+        }
+      }
+    }
+    return { x: nx, y: ny, hit };
+  }
+
+  private updateObstacles(dt: number): void {
+    // Hazard obstacles deal damage like standing in a zone (no telegraph).
+    for (const ob of this.obstacles.values()) {
+      if (ob.kind !== "hazard") continue;
+      for (const p of this.players.values()) {
+        if (p.downed || p.iFrames > 0) continue;
+        const inside =
+          ob.shape === "circle"
+            ? (p.x - ob.x) ** 2 + (p.y - ob.y) ** 2 <= ob.radius * ob.radius
+            : p.x >= ob.x && p.x <= ob.x + ob.w && p.y >= ob.y && p.y <= ob.y + ob.h;
+        if (inside) this.applyDamage(p, OBSTACLE_HAZARD_DPS * dt);
+      }
+    }
+  }
+
+  private updatePickups(dt: number): void {
+    // Periodic health pack spawn.
+    this.healthPackCooldown -= dt;
+    if (this.healthPackCooldown <= 0) {
+      this.healthPackCooldown = HEALTH_PACK_SPAWN_INTERVAL;
+      this.spawnHealthPack();
+    }
+    // Walk-over pickup.
+    for (const [id, pk] of [...this.pickups]) {
+      for (const p of this.players.values()) {
+        if (p.downed) continue;
+        const dx = p.x - pk.x;
+        const dy = p.y - pk.y;
+        if (dx * dx + dy * dy <= HEALTH_PACK_PICKUP_RANGE * HEALTH_PACK_PICKUP_RANGE) {
+          if (p.hp < p.maxHp) {
+            p.hp = Math.min(p.maxHp, p.hp + HEALTH_PACK_HEAL);
+            this.pickups.delete(id);
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  private spawnHealthPack(x?: number, y?: number): void {
+    const id = nextPickupId++;
+    const px = x ?? (60 + Math.random() * (WORLD_WIDTH - 120));
+    const py = y ?? (60 + Math.random() * (WORLD_HEIGHT - 120));
+    this.pickups.set(id, { id, x: px, y: py, kind: "health" });
   }
 
   private spawnBoss(): void {
@@ -448,6 +737,8 @@ export class World {
   private updatePlayers(dt: number): void {
     for (const p of this.players.values()) {
       if (p.iFrames > 0) p.iFrames = Math.max(0, p.iFrames - dt);
+      if (p.dashCooldown > 0) p.dashCooldown = Math.max(0, p.dashCooldown - dt);
+      if (p.dashTime > 0) p.dashTime = Math.max(0, p.dashTime - dt);
 
       // Mana regen always
       if (p.mana < p.maxMana) {
@@ -459,17 +750,44 @@ export class World {
       // If this player is currently in a box menu, freeze input
       const inBoxMenu = [...this.boxes.values()].some((b) => b.openerId === p.id);
       const input = inBoxMenu
-        ? { mx: 0, my: 0, charging: false }
+        ? { mx: 0, my: 0, charging: false, dashPressed: false }
         : p.bufferedInput;
 
-      // Movement (acceleration-based, see CONTEXT.md: smooth motion)
+      // Dash: edge-triggered, costs no mana, grants brief i-frames. No dash while
+      // downed (handled above) or still on cooldown.
+      if (input.dashPressed && p.dashCooldown <= 0 && p.dashTime <= 0) {
+        let dx = input.mx;
+        let dy = input.my;
+        if (dx === 0 && dy === 0) {
+          dx = p.facingX;
+          dy = p.facingY;
+        }
+        const len = Math.hypot(dx, dy) || 1;
+        dx /= len;
+        dy /= len;
+        p.facingX = dx;
+        p.facingY = dy;
+        p.vx = dx * DASH_SPEED;
+        p.vy = dy * DASH_SPEED;
+        p.dashTime = DASH_DURATION;
+        p.dashCooldown = DASH_COOLDOWN;
+        p.iFrames = Math.max(p.iFrames, DASH_I_FRAMES);
+      }
+
       const moving = input.mx !== 0 || input.my !== 0;
       if (moving) {
         const len = Math.hypot(input.mx, input.my) || 1;
         const nx = input.mx / len;
         const ny = input.my / len;
-        p.vx += nx * PLAYER_ACCEL * dt;
-        p.vy += ny * PLAYER_ACCEL * dt;
+        p.facingX = nx;
+        p.facingY = ny;
+      }
+
+      if (p.dashTime > 0) {
+        // During the dash burst, maintain dash velocity (ignore accel/decel).
+      } else if (moving) {
+        p.vx += p.facingX * PLAYER_ACCEL * dt;
+        p.vy += p.facingY * PLAYER_ACCEL * dt;
         const speed = Math.hypot(p.vx, p.vy);
         if (speed > PLAYER_MAX_SPEED) {
           p.vx = (p.vx / speed) * PLAYER_MAX_SPEED;
@@ -496,6 +814,16 @@ export class World {
       p.x = Math.max(r, Math.min(WORLD_WIDTH - r, p.x));
       p.y = Math.max(r, Math.min(WORLD_HEIGHT - r, p.y));
 
+      // Solid block obstacles push the player out.
+      const col = this.collideObstacle(p.x, p.y, r);
+      if (col.hit) {
+        p.x = col.x;
+        p.y = col.y;
+        // Kill velocity into the wall so we don't stick vibrating against it.
+        p.vx *= 0.2;
+        p.vy *= 0.2;
+      }
+
       // Swap charge progression (ADR 0001: both must charge to fire)
       p.charging = input.charging && p.mana >= SWAP_MANA_COST;
       if (p.charging) {
@@ -509,8 +837,6 @@ export class World {
         w.cooldown -= dt;
         if (w.kind === "orbit") {
           w.orbitPhase += ORBIT_ANGULAR_SPEED * dt;
-          // Ensure at least countFor(w) orbit projectiles exist
-          // (orbit projectiles persist; recreated each step from weapon)
           continue;
         }
         if (w.cooldown <= 0) {
@@ -629,8 +955,8 @@ export class World {
       return;
     }
 
-    // Aimed weapons (pulse/spread/lance/frost/homing): target nearest enemy
-    const target = this.findNearestEnemy(p.x, p.y, AUTO_ATTACK_RANGE);
+    // Aimed weapons (pulse/spread/lance/frost/homing): target nearest enemy in range
+    const target = this.findNearestEnemy(p.x, p.y, def.range);
     if (!target) return;
 
     const baseAngle = Math.atan2(target.y - p.y, target.x - p.x);
@@ -646,17 +972,20 @@ export class World {
   private fireChain(p: InternalPlayer, w: InternalWeapon, links: number, dmg: number): void {
     const def = WEAPON_DEFS[w.kind];
     let from = { x: p.x, y: p.y };
-    let current = this.findNearestEnemy(from.x, from.y, AUTO_ATTACK_RANGE);
+    let current = this.findNearestEnemy(from.x, from.y, def.range);
     if (!current) return;
     const hit = new Set<number>();
     let damage = dmg;
     for (let i = 0; i < links && current; i++) {
       hit.add(current.id);
+      const applied = Math.min(damage, current.hp + damage); // cap at the HP the enemy actually had
       current.hp -= damage;
+      this.recordDamage(p.id, applied);
       if (current.hp <= 0) {
         const eid = current.id;
         this.enemies.delete(eid);
         if (Math.random() < BOX_DROP_CHANCE) this.spawnBox(current.x, current.y);
+        if (Math.random() < HEALTH_PACK_DROP_CHANCE) this.spawnHealthPack(current.x, current.y);
       }
       // Visual spark from `from` to current
       this.spawnSpark(def.color, from.x, from.y, current.x, current.y);
@@ -835,20 +1164,16 @@ export class World {
     return 1;
   }
 
-  private spawnAtEdge(def: EnemyDef): void {
+  private spawnEnemyAt(def: EnemyDef, x: number, y: number): void {
+    if (this.enemies.size >= ENEMY_CAP) return;
     const id = nextEnemyId++;
-    const side = Math.floor(Math.random() * 4);
-    let x = 0;
-    let y = 0;
     const r = def.radius;
-    if (side === 0) { x = Math.random() * WORLD_WIDTH; y = r; }
-    else if (side === 1) { x = WORLD_WIDTH - r; y = Math.random() * WORLD_HEIGHT; }
-    else if (side === 2) { x = Math.random() * WORLD_WIDTH; y = WORLD_HEIGHT - r; }
-    else { x = r; y = Math.random() * WORLD_HEIGHT; }
+    const cx = Math.max(r, Math.min(WORLD_WIDTH - r, x));
+    const cy = Math.max(r, Math.min(WORLD_HEIGHT - r, y));
     this.enemies.set(id, {
       id,
-      x,
-      y,
+      x: cx,
+      y: cy,
       hp: def.hp + this.wave * 2,
       kind: def.kind,
       vx: 0,
@@ -858,15 +1183,97 @@ export class World {
     });
   }
 
+  /** Edge anchor + inward direction for a given side (0=top,1=right,2=bottom,3=left). */
+  private edgeAnchor(side: number, inset: number): { x: number; y: number; idx: number; idy: number } {
+    let x = 0;
+    let y = 0;
+    let idx = 0;
+    let idy = 0;
+    if (side === 0) { x = Math.random() * WORLD_WIDTH; y = inset; idy = 1; }
+    else if (side === 1) { x = WORLD_WIDTH - inset; y = Math.random() * WORLD_HEIGHT; idx = -1; }
+    else if (side === 2) { x = Math.random() * WORLD_WIDTH; y = WORLD_HEIGHT - inset; idy = -1; }
+    else { x = inset; y = Math.random() * WORLD_HEIGHT; idx = 1; }
+    // Tangent vector (along the edge)
+    return { x, y, idx, idy };
+  }
+
+  /**
+   * Spawn a formation (cluster / line / ring / V / double-edge) instead of a
+   * single random edge enemy. Pattern is keyed by wave so each wave feels
+   * distinct; boss waves skip this (boss + adds only).
+   */
+  private spawnFormation(): void {
+    const w = this.wave;
+    const patterns: Array<"cluster" | "line" | "ring" | "v" | "doubleEdge"> = [
+      "cluster",
+      "line",
+      "v",
+      "ring",
+      "doubleEdge",
+    ];
+    const pattern = patterns[w % patterns.length];
+    const def = ENEMY_DEFS[this.pickSpawnKind()] ?? ENEMY_DEFS[1];
+    const inset = 24;
+    const side = Math.floor(Math.random() * 4);
+    const anchor = this.edgeAnchor(side, inset);
+    // Tangent = perpendicular to inward direction.
+    const tx = -anchor.idy;
+    const ty = anchor.idx;
+    const baseN = 4 + Math.floor(w / 4);
+    const n = Math.min(baseN, ENEMY_CAP - this.enemies.size);
+    if (n <= 0) return;
+
+    if (pattern === "cluster") {
+      for (let i = 0; i < n; i++) {
+        const ang = Math.random() * Math.PI * 2;
+        const rad = Math.random() * 36;
+        this.spawnEnemyAt(def, anchor.x + Math.cos(ang) * rad, anchor.y + Math.sin(ang) * rad);
+      }
+    } else if (pattern === "line") {
+      const spacing = 38;
+      for (let i = 0; i < n; i++) {
+        const o = (i - (n - 1) / 2) * spacing;
+        this.spawnEnemyAt(def, anchor.x + tx * o, anchor.y + ty * o);
+      }
+    } else if (pattern === "ring") {
+      const radius = 56;
+      for (let i = 0; i < n; i++) {
+        const ang = (i / n) * Math.PI * 2;
+        this.spawnEnemyAt(def, anchor.x + anchor.idx * 30 + Math.cos(ang) * radius, anchor.y + anchor.idy * 30 + Math.sin(ang) * radius);
+      }
+    } else if (pattern === "v") {
+      // Two arms forming a V pointing inward from the edge anchor.
+      const armLen = Math.ceil(n / 2);
+      const spread = 30;
+      for (let i = 0; i < armLen; i++) {
+        const d = (i + 1) * spread;
+        // Left arm: inward + tangent*0.6
+        this.spawnEnemyAt(def, anchor.x + anchor.idx * d + tx * d * 0.6, anchor.y + anchor.idy * d + ty * d * 0.6);
+        // Right arm: inward - tangent*0.6 (skip duplicate of center if odd)
+        if (i < armLen - 1 || n % 2 === 0) {
+          this.spawnEnemyAt(def, anchor.x + anchor.idx * d - tx * d * 0.6, anchor.y + anchor.idy * d - ty * d * 0.6);
+        }
+      }
+    } else {
+      // doubleEdge: spawn half on `side`, half on the opposite edge.
+      const opp = (side + 2) % 4;
+      const a2 = this.edgeAnchor(opp, inset);
+      const half = Math.floor(n / 2);
+      for (let i = 0; i < half; i++) this.spawnEnemyAt(def, anchor.x + tx * (i - half / 2) * 30, anchor.y + ty * (i - half / 2) * 30);
+      const t2x = -a2.idy;
+      const t2y = a2.idx;
+      for (let i = 0; i < n - half; i++) this.spawnEnemyAt(def, a2.x + t2x * (i - (n - half) / 2) * 30, a2.y + t2y * (i - (n - half) / 2) * 30);
+    }
+  }
+
   private updateSpawns(dt: number): void {
     if (this.isBossWave) return;
     if (this.enemies.size >= ENEMY_CAP) return;
     this.enemySpawnCooldown -= dt;
     if (this.enemySpawnCooldown <= 0) {
-      // Spawn rate scales with wave
-      this.enemySpawnCooldown = Math.max(0.3, ENEMY_SPAWN_INTERVAL - this.wave * 0.05);
-      const def = ENEMY_DEFS[this.pickSpawnKind()] ?? ENEMY_DEFS[1];
-      this.spawnAtEdge(def);
+      // Spawn rate scales with wave; each tick spawns a whole formation.
+      this.enemySpawnCooldown = Math.max(0.5, ENEMY_SPAWN_INTERVAL - this.wave * 0.04);
+      this.spawnFormation();
     }
   }
 
@@ -946,6 +1353,14 @@ export class World {
 
       e.x += e.vx * dt;
       e.y += e.vy * dt;
+
+      // Solid blocks push enemies out too (but enemies can occupy hazard tiles).
+      const er = def.radius;
+      const ecol = this.collideObstacle(e.x, e.y, er);
+      if (ecol.hit) {
+        e.x = ecol.x;
+        e.y = ecol.y;
+      }
     }
   }
 
@@ -1055,14 +1470,7 @@ export class World {
         const dx = p.x - z.x;
         const dy = p.y - z.y;
         if (dx * dx + dy * dy <= z.radius * z.radius) {
-          p.hp -= z.dps * dt;
-          if (p.hp <= 0) {
-            p.hp = 0;
-            p.downed = true;
-            p.bufferedInput = { mx: 0, my: 0, charging: false };
-            p.chargeProgress = 0;
-            p.charging = false;
-          }
+          this.applyDamage(p, z.dps * dt);
         }
       }
     }
@@ -1122,14 +1530,7 @@ export class World {
       const dy = p.y - pr.y;
       const r = PLAYER_RADIUS + PROJECTILE_RADIUS;
       if (dx * dx + dy * dy < r * r) {
-        p.hp -= pr.damage;
-        if (p.hp <= 0) {
-          p.hp = 0;
-          p.downed = true;
-          p.bufferedInput = { mx: 0, my: 0, charging: false };
-          p.chargeProgress = 0;
-          p.charging = false;
-        }
+        this.applyDamage(p, pr.damage);
         this.projectiles.delete(id);
         return;
       }
@@ -1154,13 +1555,18 @@ export class World {
       const dy = e.y - pr.y;
       const r = (ENEMY_DEFS[e.kind]?.radius ?? ENEMY_RADIUS) + PROJECTILE_RADIUS;
       if (dx * dx + dy * dy < r * r) {
+        const applied = Math.min(pr.damage, Math.max(0, e.hp));
         e.hp -= pr.damage;
+        if (applied > 0) this.recordDamage(pr.ownerId, applied);
         if (pr.weaponKind === "frost") e.slowTimer = FROST_SLOW_DURATION;
         if (e.hp <= 0) {
           this.enemies.delete(eid);
           const dropChance = e.kind === 2 ? BOSS_DROP_CHANCE : BOX_DROP_CHANCE;
           if (Math.random() < dropChance) {
             this.spawnBox(e.x, e.y);
+          }
+          if (Math.random() < HEALTH_PACK_DROP_CHANCE) {
+            this.spawnHealthPack(e.x, e.y);
           }
         }
         if (!pr.piercing) {
@@ -1214,12 +1620,17 @@ export class World {
       const dx = e.x - pr.x;
       const dy = e.y - pr.y;
       if (dx * dx + dy * dy <= MINE_BLAST_RADIUS * MINE_BLAST_RADIUS) {
+        const applied = Math.min(pr.damage, Math.max(0, e.hp));
         e.hp -= pr.damage;
+        if (applied > 0) this.recordDamage(pr.ownerId, applied);
         if (e.hp <= 0) {
           this.enemies.delete(eid);
           const dropChance = e.kind === 2 ? BOSS_DROP_CHANCE : BOX_DROP_CHANCE;
           if (Math.random() < dropChance) {
             this.spawnBox(e.x, e.y);
+          }
+          if (Math.random() < HEALTH_PACK_DROP_CHANCE) {
+            this.spawnHealthPack(e.x, e.y);
           }
         }
       }
@@ -1227,7 +1638,7 @@ export class World {
   }
 
   private resolveCombat(dt: number): void {
-    // Enemy contact damage
+    // Enemy contact damage (shield absorbs first via applyDamage)
     for (const e of this.enemies.values()) {
       const def = ENEMY_DEFS[e.kind] ?? ENEMY_DEFS[1];
       if (def.damage <= 0) continue;
@@ -1237,14 +1648,7 @@ export class World {
         const dy = p.y - e.y;
         const r = PLAYER_RADIUS + def.radius;
         if (dx * dx + dy * dy < r * r) {
-          p.hp -= def.damage * dt;
-          if (p.hp <= 0) {
-            p.hp = 0;
-            p.downed = true;
-            p.bufferedInput = { mx: 0, my: 0, charging: false };
-            p.chargeProgress = 0;
-            p.charging = false;
-          }
+          this.applyDamage(p, def.damage * dt);
         }
       }
     }
@@ -1257,12 +1661,18 @@ export class World {
         const dy = e.y - pr.y;
         const r = (ENEMY_DEFS[e.kind]?.radius ?? ENEMY_RADIUS) + PROJECTILE_RADIUS;
         if (dx * dx + dy * dy < r * r) {
-          e.hp -= dmg * dt * 4; // orbit ticks continuously, scale down per-frame
+          const tickDmg = dmg * dt * 4; // orbit ticks continuously, scale down per-frame
+          const applied = Math.min(tickDmg, Math.max(0, e.hp));
+          e.hp -= tickDmg;
+          if (applied > 0) this.recordDamage(pr.ownerId, applied);
           if (e.hp <= 0) {
             this.enemies.delete(eid);
             const dropChance = e.kind === 2 ? BOSS_DROP_CHANCE : BOX_DROP_CHANCE;
             if (Math.random() < dropChance) {
               this.spawnBox(e.x, e.y);
+            }
+            if (Math.random() < HEALTH_PACK_DROP_CHANCE) {
+              this.spawnHealthPack(e.x, e.y);
             }
           }
         }
@@ -1310,9 +1720,14 @@ export class World {
       maxHp: p.maxHp,
       mana: p.mana,
       maxMana: p.maxMana,
+      shieldHp: p.shieldHp,
+      maxShield: p.maxShield,
       charging: p.charging,
       chargeProgress: p.chargeProgress,
       iFrames: p.iFrames,
+      dashCooldown: p.dashCooldown,
+      dashTime: p.dashTime,
+      dps: p.dps,
       downed: p.downed,
       reviveProgress: p.reviveProgress,
       color: p.color,
@@ -1347,6 +1762,23 @@ export class World {
     }));
     const boxes: BoxState[] = [...this.boxes.values()];
     const zones: ZoneState[] = [...this.zones.values()];
+    const obstacles: ObstacleState[] = [...this.obstacles.values()].map((o) => ({
+      id: o.id,
+      kind: o.kind,
+      shape: o.shape,
+      x: o.x,
+      y: o.y,
+      w: o.w,
+      h: o.h,
+      radius: o.radius,
+      color: o.color,
+    }));
+    const pickups: PickupState[] = [...this.pickups.values()].map((pk) => ({
+      id: pk.id,
+      x: pk.x,
+      y: pk.y,
+      kind: pk.kind,
+    }));
     return {
       t: this.time,
       tick: this.tick,
@@ -1355,6 +1787,8 @@ export class World {
       projectiles,
       boxes,
       zones,
+      obstacles,
+      pickups,
       wave: this.wave,
       waveTimer: this.waveTimer,
       isBossWave: this.isBossWave,
@@ -1379,9 +1813,14 @@ export class World {
       this.players.set(ps.id, {
         ...ps,
         weapons: ps.weapons.map((w) => ({ ...w })),
-        bufferedInput: { mx: 0, my: 0, charging: false },
+        bufferedInput: { mx: 0, my: 0, charging: false, dashPressed: false },
         pendingOpenBoxId: null,
         reviveProgress: ps.reviveProgress,
+        facingX: 1,
+        facingY: 0,
+        damageLog: [],
+        damageAccum: 0,
+        damageWindowStart: 0,
       });
     }
     this.enemies.clear();
@@ -1406,6 +1845,14 @@ export class World {
     for (const z of snap.zones) {
       this.zones.set(z.id, { ...z });
     }
+    this.obstacles.clear();
+    for (const o of snap.obstacles) {
+      this.obstacles.set(o.id, { ...o });
+    }
+    this.pickups.clear();
+    for (const pk of snap.pickups) {
+      this.pickups.set(pk.id, { ...pk });
+    }
   }
 
   getRunStatus(): RunStatus {
@@ -1424,9 +1871,14 @@ export class World {
       maxHp: p.maxHp,
       mana: p.mana,
       maxMana: p.maxMana,
+      shieldHp: p.shieldHp,
+      maxShield: p.maxShield,
       charging: p.charging,
       chargeProgress: p.chargeProgress,
       iFrames: p.iFrames,
+      dashCooldown: p.dashCooldown,
+      dashTime: p.dashTime,
+      dps: p.dps,
       downed: p.downed,
       reviveProgress: p.reviveProgress,
       color: p.color,
@@ -1461,6 +1913,14 @@ export class World {
     return [...this.zones.values()];
   }
 
+  getObstacles(): ObstacleState[] {
+    return [...this.obstacles.values()];
+  }
+
+  getPickups(): PickupState[] {
+    return [...this.pickups.values()];
+  }
+
   getWaveInfo(): { wave: number; waveTimer: number; isBossWave: boolean; bossTimer: number } {
     return {
       wave: this.wave,
@@ -1487,4 +1947,8 @@ export {
   ZONE_COLOR,
   ZONE_RADIUS,
   MINE_BLAST_RADIUS,
+  OBSTACLE_BLOCK_COLOR,
+  OBSTACLE_HAZARD_COLOR,
+  HEALTH_PACK_RADIUS,
+  HEALTH_PACK_COLOR,
 };

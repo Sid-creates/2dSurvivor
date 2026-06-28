@@ -1,11 +1,11 @@
 // Short room code generation. A room code is a 4-character uppercase alphanumeric
-// string (no ambiguous chars like O/0, I/1). Internally we namespace it as
-// "2ds-<code>" when registering with the PeerJS broker, to avoid collisions
-// with other apps using the same public broker.
+// string (no ambiguous chars like O/0, I/1). The code maps directly to a PartyKit
+// room id, namespaced as "2ds-<code>" so rooms never collide with other apps on
+// the same PartyKit account.
 
 const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // 32 chars, no 0/O/1/I
 const CODE_LENGTH = 4;
-const PEER_NAMESPACE = "2ds-";
+const ROOM_NAMESPACE = "2ds-";
 
 export function generateRoomCode(): string {
   let code = "";
@@ -17,15 +17,9 @@ export function generateRoomCode(): string {
   return code;
 }
 
-export function roomCodeToPeerId(code: string): string {
-  return PEER_NAMESPACE + code.toUpperCase();
-}
-
-export function peerIdToRoomCode(peerId: string): string {
-  if (peerId.startsWith(PEER_NAMESPACE)) {
-    return peerId.slice(PEER_NAMESPACE.length);
-  }
-  return peerId;
+// The PartyKit room id for a given human-readable code.
+export function roomCodeToRoomId(code: string): string {
+  return ROOM_NAMESPACE + code.toUpperCase();
 }
 
 export function isValidRoomCode(input: string): boolean {
@@ -35,4 +29,12 @@ export function isValidRoomCode(input: string): boolean {
     if (!ALPHABET.includes(ch)) return false;
   }
   return true;
+}
+
+// A short, unique player id used as the PartySocket connection id and the
+// authoritative player id inside the sim. Stays short so snapshots stay small.
+export function generatePlayerId(): string {
+  const arr = new Uint32Array(2);
+  crypto.getRandomValues(arr);
+  return ALPHABET[arr[0] % ALPHABET.length] + ALPHABET[arr[1] % ALPHABET.length] + Date.now().toString(36).slice(-4);
 }

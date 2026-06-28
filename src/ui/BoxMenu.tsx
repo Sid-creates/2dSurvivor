@@ -57,7 +57,9 @@ function OptionCard({
 }) {
   const def = WEAPON_DEFS[option.kind];
   const isHeal = option.resultingLevel === 0;
-  const isUpgrade = option.upgradeIndex >= 0;
+  const isShield = option.shield !== undefined;
+  const isUpgrade = !isHeal && !isShield && option.upgradeIndex >= 0;
+  const accentColor = isShield ? 0x7dd3fc : def.color;
 
   return (
     <button
@@ -67,24 +69,29 @@ function OptionCard({
       <div className="flex w-full items-center justify-between">
         <span
           className="inline-block h-3 w-3 rounded-full"
-          style={{ backgroundColor: `#${def.color.toString(16).padStart(6, "0")}` }}
+          style={{ backgroundColor: `#${accentColor.toString(16).padStart(6, "0")}` }}
         />
         <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--color-text-faint)]">
-          {isHeal ? "heal" : isUpgrade ? `lv ${option.resultingLevel}` : "new"}
+          {isHeal ? "heal" : isShield ? "shield" : isUpgrade ? `lv ${option.resultingLevel}` : "new"}
         </span>
       </div>
       <div>
         <p className="text-sm font-medium text-[var(--color-text)]">
-          {isHeal ? "Mend" : def.name}
+          {isHeal ? "Mend" : isShield ? "Aegis" : def.name}
         </p>
         <p className="mt-1 text-xs text-[var(--color-text-muted)]">
-          {isHeal ? "Restore some HP and close the box." : def.description}
+          {isHeal
+            ? "Restore some HP and close the box."
+            : isShield
+              ? `Add +${option.shield} absorb shield. Damage hits this before HP.`
+              : def.description}
         </p>
       </div>
-      {!isHeal && (
+      {!isHeal && !isShield && (
         <div className="flex flex-wrap gap-1.5 pt-1">
           <Stat label="dmg" value={def.baseDamage.toString()} />
           <Stat label="rate" value={`${(1 / def.baseInterval).toFixed(1)}/s`} />
+          <Stat label="range" value={def.range.toString()} />
           {def.piercing && <Stat label="pierce" value="yes" />}
           {def.orbit && <Stat label="orbit" value="yes" />}
         </div>

@@ -100,3 +100,32 @@ export const REVIVE_DURATION = 2.5; // seconds of proximity to revive
 
 export const ORBIT_RADIUS = 50;
 export const ORBIT_ANGULAR_SPEED = 4; // radians per second
+
+// --- Dash (Phase B) ---
+export const DASH_SPEED = 640; // px/s burst velocity
+export const DASH_DURATION = 0.15; // seconds the burst is maintained
+export const DASH_COOLDOWN = 3.0; // seconds before the next dash
+export const DASH_I_FRAMES = 0.18; // i-frames granted at dash start
+
+// --- Shield (defensive item, Phase B) ---
+export const PLAYER_MAX_SHIELD = 60;
+export const SHIELD_PER_PICKUP = 35;
+
+// --- Per-wave obstacle field (Phase B) ---
+export const OBSTACLE_BLOCK_COLOR = 0x3a3a42;
+export const OBSTACLE_HAZARD_COLOR = 0xb91c1c;
+export const OBSTACLE_HAZARD_DPS = 22; // damage per second for hazard obstacles
+export const OBSTACLE_BLOCK_MARGIN = 60; // keep blocks away from spawn lanes / edges
+export const OBSTACLE_COUNT_BASE = 4; // base obstacles per wave
+export const OBSTACLE_HAZARD_CHANCE = 0.28; // chance a given obstacle is a hazard
+
+// --- Health packs (Phase B) ---
+export const HEALTH_PACK_HEAL = 35;
+export const HEALTH_PACK_SPAWN_INTERVAL = 13; // seconds between periodic spawns
+export const HEALTH_PACK_RADIUS = 12;
+export const HEALTH_PACK_COLOR = 0x22c55e;
+export const HEALTH_PACK_DROP_CHANCE = 0.02; // extra drop chance per enemy kill
+export const HEALTH_PACK_PICKUP_RANGE = PLAYER_RADIUS + HEALTH_PACK_RADIUS + 4;
+
+// --- DPS meter (Phase B) ---
+export const DPS_WINDOW_SECONDS = 5; // rolling window for per-player DPS

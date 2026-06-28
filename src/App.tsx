@@ -32,9 +32,6 @@ export function App() {
   const gameRef = useRef<Phaser.Game | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const inGameRef = useRef(false);
-  // Captured from the guest's "hello" so GameScene can spawn the guest player
-  // even if the scene registers its message listener after hello already arrived.
-  const guestPeerIdRef = useRef<string | null>(null);
   useEffect(() => {
     inGameRef.current = inGame;
   }, [inGame]);
@@ -49,25 +46,11 @@ export function App() {
       bridge.emit({ type: "connection", state, message });
     });
 
+    // Both clients start the game on the first authoritative snapshot from the
+    // server. No hello handshake, no host role.
     const offLobby = net.onMessage((msg) => {
-      if (msg.kind === "hello" && msg.role === "guest") {
-        guestPeerIdRef.current = msg.peerId;
-        bridge.emit({
-          type: "lobby",
-          hostPeerId: net.getLocalPeerId() ?? "",
-          guestPeerId: msg.peerId,
-        });
-        startGame();
-      } else if (msg.kind === "snapshot" && net.getRole() === "guest") {
+      if (msg.kind === "snapshot") {
         if (!inGameRef.current) startGame();
-      } else if (msg.kind === "runEnded") {
-        // Host told us the run is over
-        const snap = lastSnapshotRef.current;
-        setRunEnd({
-          status: msg.status,
-          runTime: snap?.runTime ?? 0,
-          wave: snap?.wave ?? 1,
-        });
       }
     });
 
@@ -75,8 +58,11 @@ export function App() {
       if (intent.type === "hostGame") {
         net.host();
         bridge.emit({ type: "localPeerId", peerId: null });
+        bridge.emit({ type: "roomCode", code: net.getRoomCode() });
       } else if (intent.type === "joinGame") {
         net.join(intent.hostPeerId);
+        bridge.emit({ type: "localPeerId", peerId: null });
+        bridge.emit({ type: "roomCode", code: net.getRoomCode() });
       } else if (intent.type === "disconnect") {
         net.teardown();
       } else if (intent.type === "openBox") {
@@ -88,14 +74,16 @@ export function App() {
         setRunEnd(null);
         setBoxMenu(null);
         setPhase("lobby");
-        // Re-init net so a new game can be hosted
         net.teardown();
       }
     });
 
+    // Surface the local player id + room code to the bridge as soon as they exist.
     const idInterval = setInterval(() => {
       const id = net.getLocalPeerId();
       if (id) bridge.emit({ type: "localPeerId", peerId: id });
+      const code = net.getRoomCode();
+      if (code) bridge.emit({ type: "roomCode", code });
     }, 100);
 
     return () => {
@@ -163,20 +151,14 @@ export function App() {
     };
   }, []);
 
-  // Forward peer id to bridge once connected
+  // Forward local player id + room code to bridge once connected
   useEffect(() => {
     const off = bridge.on("connection", (e) => {
       if (e.state === "connected") {
         const id = netRef.current?.getLocalPeerId() ?? null;
         if (id) bridge.emit({ type: "localPeerId", peerId: id });
-        const remote = netRef.current?.getRemotePeerId() ?? null;
-        if (remote) {
-          bridge.emit({
-            type: "lobby",
-            hostPeerId: netRef.current?.getRole() === "host" ? id ?? "" : remote,
-            guestPeerId: netRef.current?.getRole() === "host" ? remote : id,
-          });
-        }
+        const code = netRef.current?.getRoomCode() ?? null;
+        if (code) bridge.emit({ type: "roomCode", code });
       }
     });
     return () => {
@@ -212,7 +194,6 @@ export function App() {
 
       gameRef.current.scene.start("GameScene", {
         localPlayerId: localId,
-        guestPeerId: guestPeerIdRef.current,
       });
     }
   }
@@ -264,6 +245,9 @@ export function App() {
         ref={containerRef}
         className="absolute inset-0 flex items-center justify-center"
       />
+
+      {/* CRT retro overlay: scanlines + vignette + aberration. Above canvas, below menus. */}
+      {phase === "in-game" && <div className="crt-overlay" aria-hidden="true" />}
 
       {phase === "in-game" && <Hud />}
       {phase === "in-game" && boxMenu && (

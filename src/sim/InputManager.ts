@@ -1,5 +1,5 @@
-// Local input capture. Keyboard-driven 8-direction movement + space-to-charge
-// + E to open nearby box.
+// Local input capture. Keyboard-driven 8-direction movement + Space to charge
+// the Swap + E to open a nearby box + Shift to dash.
 
 import type Phaser from "phaser";
 import type { PlayerInput } from "../shared/types";
@@ -18,7 +18,9 @@ export class InputManager {
   private keyD: Phaser.Input.Keyboard.Key;
   private space: Phaser.Input.Keyboard.Key;
   private keyE: Phaser.Input.Keyboard.Key;
+  private shift: Phaser.Input.Keyboard.Key;
   private prevE = false;
+  private prevDash = false;
 
   constructor(keyboard: Phaser.Input.Keyboard.KeyboardPlugin) {
     this.cursors = keyboard.createCursorKeys();
@@ -28,6 +30,7 @@ export class InputManager {
     this.keyD = keyboard.addKey("D");
     this.space = keyboard.addKey("SPACE");
     this.keyE = keyboard.addKey("E");
+    this.shift = keyboard.addKey("SHIFT");
   }
 
   sample(): FrameInput {
@@ -40,8 +43,11 @@ export class InputManager {
     const eDown = this.keyE.isDown;
     const justPressedE = eDown && !this.prevE;
     this.prevE = eDown;
+    const dashDown = this.shift.isDown;
+    const justPressedDash = dashDown && !this.prevDash;
+    this.prevDash = dashDown;
     return {
-      movement: { mx, my, charging: this.space.isDown },
+      movement: { mx, my, charging: this.space.isDown, dashPressed: justPressedDash },
       openBoxPressed: justPressedE,
     };
   }

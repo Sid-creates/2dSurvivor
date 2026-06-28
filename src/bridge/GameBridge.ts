@@ -10,6 +10,7 @@ export type BridgeEvent =
   | { type: "connection"; state: import("../shared/types").ConnectionState; message?: string }
   | { type: "role"; role: import("../shared/types").PeerRole | null }
   | { type: "localPeerId"; peerId: string | null }
+  | { type: "roomCode"; code: string | null }
   | { type: "swapCharge"; playerId: string; progress: number }
   | { type: "swapFired"; aId: string; bId: string }
   | { type: "boxMenu"; boxId: number; playerId: string; options: import("../shared/types").WeaponPickOption[] }

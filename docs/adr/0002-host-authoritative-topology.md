@@ -1,5 +1,10 @@
 # 0002 - Host-authoritative network topology
 
+> **Superseded by [0004](./0004-server-authoritative-partykit-topology.md).**
+> We moved off the PeerJS host-authoritative P2P topology to a PartyKit
+> server-authoritative model because the guest player carried the host's
+> simulation round-trip as input latency. 0002 is retained for history.
+
 ## Context
 
 2DSurvivor is a WebRTC peer-to-peer game starting at 2 players and scaling to 4. The world can contain hundreds of simultaneous enemies, projectiles, and loot boxes. We had to choose between host-authoritative simulation (one peer simulates, others render) and symmetric lockstep/rollback (all peers simulate, reconcile via deterministic simulation or rollback).

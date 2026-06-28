@@ -17,6 +17,7 @@ import {
   WORLD_WIDTH,
   PLAYER_MAX_MANA,
   PLAYER_COLORS,
+  PLAYER_MAX_SPEED,
 } from "../shared/config";
 import type { Snapshot, PlayerInput } from "../shared/types";
 
@@ -34,7 +35,7 @@ function twoPlayerWorld(): World {
   return w;
 }
 
-const STOP_INPUT: PlayerInput = { mx: 0, my: 0, charging: false };
+const STOP_INPUT: PlayerInput = { mx: 0, my: 0, charging: false, dashPressed: false };
 
 /** Build a minimal valid Snapshot with optional overrides, for applySnapshot tests. */
 function makeSnapshot(overrides: Partial<Snapshot> = {}): Snapshot {
@@ -46,6 +47,8 @@ function makeSnapshot(overrides: Partial<Snapshot> = {}): Snapshot {
     projectiles: [],
     boxes: [],
     zones: [],
+    obstacles: [],
+    pickups: [],
     wave: 1,
     waveTimer: 60,
     isBossWave: false,
@@ -115,7 +118,7 @@ describe("player spawning", () => {
     // input routed to that id must actually move the guest.
     const w = twoPlayerWorld();
     const before = w.snapshot().players.find((p) => p.id === GUEST_ID)!.x;
-    w.setPlayerInput(GUEST_ID, { mx: 1, my: 0, charging: false });
+    w.setPlayerInput(GUEST_ID, { mx: 1, my: 0, charging: false, dashPressed: false });
     for (let i = 0; i < 10; i++) w.step(SIM_DT);
     const after = w.snapshot().players.find((p) => p.id === GUEST_ID)!.x;
     expect(after).toBeGreaterThan(before);
@@ -246,8 +249,8 @@ describe("boxes", () => {
 describe("positional swap", () => {
   it("swaps positions, grants i-frames, and drains mana when both charge to full", () => {
     const w = twoPlayerWorld();
-    w.setPlayerInput(HOST_ID, { mx: 0, my: 0, charging: true });
-    w.setPlayerInput(GUEST_ID, { mx: 0, my: 0, charging: true });
+    w.setPlayerInput(HOST_ID, { mx: 0, my: 0, charging: true, dashPressed: false });
+    w.setPlayerInput(GUEST_ID, { mx: 0, my: 0, charging: true, dashPressed: false });
 
     const hostBefore = w.snapshot().players.find((p) => p.id === HOST_ID)!;
     const guestBefore = w.snapshot().players.find((p) => p.id === GUEST_ID)!;
@@ -275,7 +278,7 @@ describe("positional swap", () => {
 
   it("does nothing if only one player is charging", () => {
     const w = twoPlayerWorld();
-    w.setPlayerInput(HOST_ID, { mx: 0, my: 0, charging: true });
+    w.setPlayerInput(HOST_ID, { mx: 0, my: 0, charging: true, dashPressed: false });
     w.setPlayerInput(GUEST_ID, STOP_INPUT);
 
     const hostBefore = w.snapshot().players.find((p) => p.id === HOST_ID)!.x;
@@ -311,7 +314,7 @@ describe("positional swap", () => {
       }),
     );
 
-    w.setPlayerInput(HOST_ID, { mx: 0, my: 0, charging: true });
+    w.setPlayerInput(HOST_ID, { mx: 0, my: 0, charging: true, dashPressed: false });
     const hostBefore = w.snapshot().players.find((p) => p.id === HOST_ID)!.x;
     const guestBefore = w.snapshot().players.find((p) => p.id === GUEST_ID)!.x;
 
@@ -340,8 +343,8 @@ describe("positional swap", () => {
       }),
     );
 
-    w.setPlayerInput(HOST_ID, { mx: 0, my: 0, charging: true });
-    w.setPlayerInput(GUEST_ID, { mx: 0, my: 0, charging: true });
+    w.setPlayerInput(HOST_ID, { mx: 0, my: 0, charging: true, dashPressed: false });
+    w.setPlayerInput(GUEST_ID, { mx: 0, my: 0, charging: true, dashPressed: false });
 
     for (let i = 0; i < Math.ceil(SWAP_CHARGE_DURATION / SIM_DT) + 5; i++) w.step(SIM_DT);
 
@@ -570,7 +573,7 @@ describe("box heal option", () => {
       boxes: [{ id: 6001, x: host.x, y: host.y, opened: false, openerId: null, options: null }],
       players: s.players.map((p) =>
         p.id === HOST_ID
-          ? { ...p, hp: 50, weapons: maxedWeapons }
+          ? { ...p, hp: 50, shieldHp: p.maxShield, weapons: maxedWeapons }
           : p,
       ),
     });
@@ -601,5 +604,171 @@ describe("snapshot round-trip", () => {
     expect(restored.players.map((p) => p.id).sort()).toEqual([HOST_ID, GUEST_ID]);
     expect(restored.boxes).toHaveLength(1);
     expect(restored.boxes[0].x).toBe(original.boxes[0].x);
+  });
+});
+
+describe("dash mechanic", () => {
+  it("grants i-frames, sets cooldown, and bursts velocity beyond normal speed", () => {
+    const w = twoPlayerWorld();
+    w.setPlayerInput(HOST_ID, { mx: 1, my: 0, charging: false, dashPressed: true });
+    w.step(SIM_DT);
+    const host = w.snapshot().players.find((p) => p.id === HOST_ID)!;
+    expect(host.dashCooldown).toBeGreaterThan(0);
+    expect(host.dashTime).toBeGreaterThan(0);
+    expect(host.iFrames).toBeGreaterThan(0);
+    expect(host.vx).toBeGreaterThan(PLAYER_MAX_SPEED);
+  });
+
+  it("does not dash again while on cooldown", () => {
+    const w = twoPlayerWorld();
+    w.setPlayerInput(HOST_ID, { mx: 1, my: 0, charging: false, dashPressed: true });
+    w.step(SIM_DT);
+    const cdAfter = w.snapshot().players.find((p) => p.id === HOST_ID)!.dashCooldown;
+    // Request another dash immediately; cooldown should just tick down, not reset.
+    w.setPlayerInput(HOST_ID, { mx: 1, my: 0, charging: false, dashPressed: true });
+    w.step(SIM_DT);
+    const host = w.snapshot().players.find((p) => p.id === HOST_ID)!;
+    expect(host.dashCooldown).toBeCloseTo(cdAfter - SIM_DT, 5);
+  });
+
+  it("does not dash while downed", () => {
+    const w = twoPlayerWorld();
+    const s = w.snapshot();
+    const host = s.players.find((p) => p.id === HOST_ID)!;
+    applyFromWorld(w, {
+      players: [
+        { ...host, downed: true, weapons: host.weapons },
+        ...s.players.filter((p) => p.id !== HOST_ID),
+      ],
+    });
+    // setPlayerInput is a no-op for downed players, so the dash request is dropped.
+    w.setPlayerInput(HOST_ID, { mx: 1, my: 0, charging: false, dashPressed: true });
+    w.step(SIM_DT);
+    const h = w.snapshot().players.find((p) => p.id === HOST_ID)!;
+    expect(h.dashCooldown).toBe(0);
+    expect(h.dashTime).toBe(0);
+  });
+});
+
+describe("shield absorption", () => {
+  it("absorbs incoming damage before HP", () => {
+    const w = twoPlayerWorld();
+    const s = w.snapshot();
+    const host = s.players.find((p) => p.id === HOST_ID)!;
+    applyFromWorld(w, {
+      enemies: [],
+      zones: [
+        {
+          id: 1,
+          x: host.x,
+          y: host.y,
+          radius: 72,
+          telegraph: 0,
+          active: true,
+          duration: 5,
+          dps: 100,
+          color: 0xef4444,
+        },
+      ],
+      players: s.players.map((p) =>
+        p.id === HOST_ID ? { ...p, shieldHp: 30, hp: 80, weapons: p.weapons } : p,
+      ),
+    });
+    const before = w.snapshot().players.find((p) => p.id === HOST_ID)!;
+    w.step(SIM_DT);
+    const after = w.snapshot().players.find((p) => p.id === HOST_ID)!;
+    expect(after.shieldHp).toBeLessThan(before.shieldHp);
+    expect(after.hp).toBeCloseTo(before.hp, 5);
+  });
+});
+
+describe("obstacles", () => {
+  it("solid block obstacles push the player out so they cannot overlap", () => {
+    const w = twoPlayerWorld();
+    const s = w.snapshot();
+    const host = s.players.find((p) => p.id === HOST_ID)!;
+    // Drop a circular block just off the host's center so d2 > 0 for the pushout.
+    applyFromWorld(w, {
+      obstacles: [
+        {
+          id: 1,
+          kind: "block",
+          shape: "circle",
+          x: host.x + 5,
+          y: host.y,
+          w: 0,
+          h: 0,
+          radius: 30,
+          color: 0x3a3a42,
+        },
+      ],
+      players: s.players.map((p) =>
+        p.id === HOST_ID ? { ...p, x: host.x, y: host.y, vx: 0, vy: 0 } : p,
+      ),
+    });
+    w.setPlayerInput(HOST_ID, STOP_INPUT);
+    w.step(SIM_DT);
+    const h = w.snapshot().players.find((p) => p.id === HOST_ID)!;
+    const obstacle = w.getObstacles()[0];
+    const dist = Math.hypot(h.x - obstacle.x, h.y - obstacle.y);
+    // player radius 14 + block radius 30 = 44 separation expected (allow rounding).
+    expect(dist).toBeGreaterThanOrEqual(43);
+  });
+
+  it("hazard obstacles damage players standing on them", () => {
+    const w = twoPlayerWorld();
+    const s = w.snapshot();
+    const host = s.players.find((p) => p.id === HOST_ID)!;
+    applyFromWorld(w, {
+      enemies: [],
+      obstacles: [
+        {
+          id: 1,
+          kind: "hazard",
+          shape: "circle",
+          x: host.x,
+          y: host.y,
+          w: 0,
+          h: 0,
+          radius: 40,
+          color: 0xb91c1c,
+        },
+      ],
+    });
+    const before = w.snapshot().players.find((p) => p.id === HOST_ID)!.hp;
+    w.step(SIM_DT);
+    const after = w.snapshot().players.find((p) => p.id === HOST_ID)!.hp;
+    expect(after).toBeLessThan(before);
+  });
+});
+
+describe("health packs", () => {
+  it("heals a player on walk-over and despawns", () => {
+    const w = twoPlayerWorld();
+    const s = w.snapshot();
+    const host = s.players.find((p) => p.id === HOST_ID)!;
+    applyFromWorld(w, {
+      enemies: [],
+      players: s.players.map((p) =>
+        p.id === HOST_ID ? { ...p, hp: 40, weapons: p.weapons } : p,
+      ),
+      pickups: [{ id: 1, x: host.x, y: host.y, kind: "health" }],
+    });
+    const before = w.snapshot().players.find((p) => p.id === HOST_ID)!.hp;
+    w.step(SIM_DT);
+    const after = w.snapshot().players.find((p) => p.id === HOST_ID)!.hp;
+    expect(after).toBeGreaterThan(before);
+    expect(w.getPickups().length).toBe(0);
+  });
+});
+
+describe("DPS meter", () => {
+  it("attributes weapon damage to the firing player", () => {
+    const w = twoPlayerWorld();
+    equipHostWithEnemy(w, "pulse", 100);
+    // Let a bolt travel and land: pulse interval 0.55s, projectile speed 520 px/s.
+    for (let i = 0; i < 30; i++) w.step(SIM_DT);
+    const host = w.snapshot().players.find((p) => p.id === HOST_ID)!;
+    expect(host.dps).toBeGreaterThan(0);
   });
 });
