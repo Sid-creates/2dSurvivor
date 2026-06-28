@@ -15,13 +15,12 @@ import {
   WORLD_WIDTH,
   WORLD_HEIGHT,
   PLAYER_RADIUS,
-  ENEMY_RADIUS,
-  ENEMY_COLOR,
   PROJECTILE_RADIUS,
   BOX_RADIUS,
   BOX_COLOR,
   BOX_OPEN_RANGE,
   REVIVE_RANGE,
+  ENEMY_DEFS,
 } from "../shared/config";
 import type { Snapshot } from "../shared/types";
 
@@ -30,6 +29,8 @@ export class GameScene extends Phaser.Scene {
   private net: NetClient;
   private inputManager: InputManager | null = null;
   private localPlayerId: string | null = null;
+  // Guest peer id captured before this scene was ready (hello race fix).
+  private pendingGuestId: string | null = null;
 
   private accumulator = 0;
   private snapshotAccumulator = 0;
@@ -46,8 +47,9 @@ export class GameScene extends Phaser.Scene {
     this.net = net;
   }
 
-  init(data: { localPlayerId: string }) {
+  init(data: { localPlayerId: string; guestPeerId?: string | null }) {
     this.localPlayerId = data.localPlayerId;
+    this.pendingGuestId = data.guestPeerId ?? null;
   }
 
   create() {
@@ -101,6 +103,19 @@ export class GameScene extends Phaser.Scene {
 
   private setupHost() {
     this.world.addHostPlayer(this.localPlayerId!);
+
+    // hello may have arrived before this scene registered its listener. If App
+    // captured the guest id, spawn the guest now so snapshots include both
+    // players from the very first broadcast.
+    if (this.pendingGuestId && !this.world.getPlayerIds().includes(this.pendingGuestId)) {
+      this.world.addGuestPlayer(this.pendingGuestId);
+      bridge.emit({
+        type: "lobby",
+        hostPeerId: this.localPlayerId!,
+        guestPeerId: this.pendingGuestId,
+      });
+    }
+    this.pendingGuestId = null;
 
     this.net.onMessage((msg) => {
       if (msg.kind === "hello" && msg.role === "guest") {
@@ -276,6 +291,21 @@ export class GameScene extends Phaser.Scene {
     const g = this.renderGroup;
     g.clear();
 
+    // Damage zones (drawn under everything): telegraph vs active
+    for (const z of this.world.getZones()) {
+      if (!z.active) {
+        g.fillStyle(0xef4444, 0.08);
+        g.fillCircle(z.x, z.y, z.radius);
+        g.lineStyle(3, 0xef4444, 0.85);
+        g.strokeCircle(z.x, z.y, z.radius);
+      } else {
+        g.fillStyle(0xef4444, 0.3);
+        g.fillCircle(z.x, z.y, z.radius);
+        g.lineStyle(2, 0xfca5a5, 0.9);
+        g.strokeCircle(z.x, z.y, z.radius);
+      }
+    }
+
     // Boxes
     for (const b of this.world.getBoxes()) {
       const claimed = b.openerId !== null;
@@ -291,20 +321,37 @@ export class GameScene extends Phaser.Scene {
 
     // Projectiles (orbiting drawn first so they sit under flying projectiles)
     for (const pr of this.world.getProjectiles()) {
+      if (pr.weaponKind === "mine") {
+        // Mine: small armed marker
+        g.fillStyle(pr.color, 0.95);
+        g.fillCircle(pr.x, pr.y, 6);
+        g.lineStyle(2, 0x000000, 0.5);
+        g.strokeCircle(pr.x, pr.y, 6);
+        continue;
+      }
       g.fillStyle(pr.color, 1);
       g.fillCircle(pr.x, pr.y, PROJECTILE_RADIUS);
+      if (pr.hostile) {
+        g.lineStyle(2, 0xef4444, 0.9);
+        g.strokeCircle(pr.x, pr.y, PROJECTILE_RADIUS + 2);
+      }
     }
 
     // Enemies
     for (const e of this.world.getEnemies()) {
-      const isBoss = e.kind === 2;
-      const r = isBoss ? ENEMY_RADIUS * 3 : ENEMY_RADIUS;
-      g.fillStyle(ENEMY_COLOR, 1);
+      const def = ENEMY_DEFS[e.kind] ?? ENEMY_DEFS[1];
+      const r = def.radius;
+      g.fillStyle(def.color, 1);
       g.fillCircle(e.x, e.y, r);
-      g.lineStyle(2, 0xfca5a5, 0.7);
+      g.lineStyle(2, 0x000000, 0.45);
       g.strokeCircle(e.x, e.y, r);
-      const maxHp = isBoss ? 400 : 20;
-      const hpFrac = Math.max(0, e.hp / maxHp);
+      if (def.ranged) {
+        // Casters get an inner core to read at a glance
+        g.fillStyle(0x0a0a0b, 0.6);
+        g.fillCircle(e.x, e.y, r * 0.45);
+      }
+      const maxHp = def.hp;
+      const hpFrac = Math.max(0, Math.min(1, e.hp / maxHp));
       g.fillStyle(0x000000, 0.5);
       g.fillRect(e.x - r, e.y - r - 8, r * 2, 4);
       g.fillStyle(0xef4444, 1);

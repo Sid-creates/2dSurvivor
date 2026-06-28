@@ -74,6 +74,25 @@ export interface ProjectileState {
   orbitOffset: number;
   /** Kind of weapon that fired this, for the orbit angle update. */
   weaponKind: import("../sim/weapons").WeaponKind;
+  /** True if fired by an enemy and damages players instead of enemies. */
+  hostile: boolean;
+}
+
+/** A telegraphed ground hazard that damages players standing in it. */
+export interface ZoneState {
+  id: number;
+  x: number;
+  y: number;
+  radius: number;
+  /** Seconds of warning before the zone becomes active. 0 once active. */
+  telegraph: number;
+  /** True once the zone is dealing damage. */
+  active: boolean;
+  /** Seconds the zone stays active before despawning. */
+  duration: number;
+  /** Damage per second while active. */
+  dps: number;
+  color: number;
 }
 
 /** A Box (loot container) present in the world. See CONTEXT.md: Box. */
@@ -107,6 +126,7 @@ export interface Snapshot {
   enemies: EnemyState[];
   projectiles: ProjectileState[];
   boxes: BoxState[];
+  zones: ZoneState[];
   wave: number;
   waveTimer: number;
   isBossWave: boolean;

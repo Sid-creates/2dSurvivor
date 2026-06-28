@@ -32,6 +32,9 @@ export function App() {
   const gameRef = useRef<Phaser.Game | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const inGameRef = useRef(false);
+  // Captured from the guest's "hello" so GameScene can spawn the guest player
+  // even if the scene registers its message listener after hello already arrived.
+  const guestPeerIdRef = useRef<string | null>(null);
   useEffect(() => {
     inGameRef.current = inGame;
   }, [inGame]);
@@ -48,6 +51,7 @@ export function App() {
 
     const offLobby = net.onMessage((msg) => {
       if (msg.kind === "hello" && msg.role === "guest") {
+        guestPeerIdRef.current = msg.peerId;
         bridge.emit({
           type: "lobby",
           hostPeerId: net.getLocalPeerId() ?? "",
@@ -206,7 +210,10 @@ export function App() {
         scene: [new GameScene(net)],
       });
 
-      gameRef.current.scene.start("GameScene", { localPlayerId: localId });
+      gameRef.current.scene.start("GameScene", {
+        localPlayerId: localId,
+        guestPeerId: guestPeerIdRef.current,
+      });
     }
   }
 

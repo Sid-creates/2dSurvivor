@@ -8,7 +8,11 @@ export type WeaponKind =
   | "spread" // 3-shot fan, lower per-hit damage
   | "orbit" // 2 projectiles orbiting the player
   | "lance" // long-range fast piercing shot
-  | "nova"; // radial burst every interval
+  | "nova" // radial burst every interval
+  | "chain" // chain lightning that arcs between nearby enemies
+  | "frost" // bolt that slows enemies on hit
+  | "homing" // missiles that steer toward enemies
+  | "mine"; // drops a proximity mine that explodes in an AoE
 
 export interface WeaponDef {
   kind: WeaponKind;
@@ -96,6 +100,62 @@ export const WEAPON_DEFS: Record<WeaponKind, WeaponDef> = {
     orbit: false,
     description: "Radial burst of twelve shards. Hits everything around you.",
   },
+  chain: {
+    kind: "chain",
+    name: "Arc Coil",
+    color: 0xfde68a,
+    baseDamage: 14,
+    baseInterval: 0.8,
+    projectileCount: 3, // number of enemies linked per arc
+    projectileSpeed: 0, // instant; visual sparks only
+    projectileLifetime: 0.15,
+    spread: 0,
+    piercing: true,
+    orbit: false,
+    description: "Lightning arcs from the nearest enemy to others nearby.",
+  },
+  frost: {
+    kind: "frost",
+    name: "Frost Bolt",
+    color: 0x7dd3fc,
+    baseDamage: 9,
+    baseInterval: 0.6,
+    projectileCount: 1,
+    projectileSpeed: 480,
+    projectileLifetime: 1.1,
+    spread: 0,
+    piercing: false,
+    orbit: false,
+    description: "Chilled bolt that slows enemies it strikes.",
+  },
+  homing: {
+    kind: "homing",
+    name: "Seeker Missile",
+    color: 0xf472b6,
+    baseDamage: 16,
+    baseInterval: 1.0,
+    projectileCount: 2,
+    projectileSpeed: 300,
+    projectileLifetime: 2.0,
+    spread: 0.25,
+    piercing: false,
+    orbit: false,
+    description: "Twin missiles that steer toward the nearest threat.",
+  },
+  mine: {
+    kind: "mine",
+    name: "Spore Mine",
+    color: 0x84cc16,
+    baseDamage: 30,
+    baseInterval: 1.6,
+    projectileCount: 1,
+    projectileSpeed: 0, // stationary
+    projectileLifetime: 6,
+    spread: 0,
+    piercing: false,
+    orbit: false,
+    description: "Drops a mine that bursts, damaging everything nearby.",
+  },
 };
 
 export const ALL_WEAPON_KINDS: WeaponKind[] = [
@@ -104,7 +164,11 @@ export const ALL_WEAPON_KINDS: WeaponKind[] = [
   "orbit",
   "lance",
   "nova",
+  "chain",
+  "frost",
+  "homing",
+  "mine",
 ];
 
-export const MAX_WEAPONS = 4;
-export const MAX_WEAPON_LEVEL = 4;
+export const MAX_WEAPONS = 6;
+export const MAX_WEAPON_LEVEL = 5;

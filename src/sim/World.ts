@@ -9,6 +9,7 @@ import type {
   EnemyState,
   ProjectileState,
   BoxState,
+  ZoneState,
   Snapshot,
   PlayerInput,
   WeaponPickOption,
@@ -38,11 +39,35 @@ import {
   SWAP_I_FRAMES,
   RUN_DURATION,
   ENEMY_RADIUS,
-  ENEMY_SPEED,
-  ENEMY_HP,
   ENEMY_SPAWN_INTERVAL,
-  ENEMY_DAMAGE,
   ENEMY_COLOR,
+  ENEMY_DEFS,
+  EnemyDef,
+  BOSS_BASE_HP,
+  BOSS_HP_PER_TIER,
+  CASTER_FIRE_INTERVAL,
+  CASTER_PREF_RANGE,
+  CASTER_FIRE_RANGE,
+  ENEMY_PROJ_SPEED,
+  ENEMY_PROJ_DAMAGE,
+  ENEMY_PROJ_LIFETIME,
+  BOSS_ZONE_INTERVAL,
+  BOSS_SUMMON_INTERVAL,
+  BOSS_SUMMON_COUNT,
+  ZONE_TELEGRAPH,
+  ZONE_DURATION,
+  ZONE_RADIUS,
+  ZONE_DPS,
+  ZONE_COLOR,
+  FROST_SLOW_DURATION,
+  FROST_SLOW_FACTOR,
+  MINE_ARM_TIME,
+  MINE_TRIGGER_RANGE,
+  MINE_BLAST_RADIUS,
+  MINE_LIFETIME,
+  CHAIN_RANGE,
+  HOMING_TURN_RATE,
+  ENEMY_CAP,
   PROJECTILE_RADIUS,
   AUTO_ATTACK_RANGE,
   BOX_RADIUS,
@@ -75,10 +100,30 @@ interface InternalPlayer extends PlayerState {
 interface InternalEnemy extends EnemyState {
   vx: number;
   vy: number;
+  attackCd: number; // ranged/boss attack cooldown
+  slowTimer: number; // frost slow remaining
 }
 
 interface InternalProjectile extends ProjectileState {
   lifetime: number;
+  /** For mines: seconds until armed. */
+  armTimer: number;
+  /** Damage carried for this projectile (not on the wire type). */
+  damage: number;
+  /** For homing: current heading. */
+  angle: number;
+}
+
+interface InternalZone {
+  id: number;
+  x: number;
+  y: number;
+  radius: number;
+  telegraph: number;
+  active: boolean;
+  duration: number;
+  dps: number;
+  color: number;
 }
 
 interface InternalBox {
@@ -93,6 +138,7 @@ interface InternalBox {
 let nextEnemyId = 1;
 let nextProjectileId = 1;
 let nextBoxId = 1;
+let nextZoneId = 1;
 
 function makePlayer(id: string, color: number, x: number, y: number): InternalPlayer {
   return {
@@ -137,6 +183,7 @@ export class World {
   private enemies: Map<number, InternalEnemy> = new Map();
   private projectiles: Map<number, InternalProjectile> = new Map();
   private boxes: Map<number, InternalBox> = new Map();
+  private zones: Map<number, InternalZone> = new Map();
   private tick = 0;
   private time = 0;
   private wave = 1;
@@ -188,7 +235,9 @@ export class World {
     let best: InternalBox | null = null;
     let bestDist = range * range;
     for (const b of this.boxes.values()) {
-      if (b.opened) continue;
+      // Skip opened boxes and boxes someone else is already interacting with,
+      // so a second player can't steal / re-target a claimed box.
+      if (b.opened || b.openerId !== null) continue;
       const dx = b.x - x;
       const dy = b.y - y;
       const d2 = dx * dx + dy * dy;
@@ -218,6 +267,16 @@ export class World {
     if (!box || !box.options || box.openerId !== playerId || !player) return;
     const option = box.options[optionIndex];
     if (!option) return;
+
+    // Heal sentinel (resultingLevel === 0): restore HP and close the box.
+    if (option.resultingLevel === 0) {
+      player.hp = Math.min(player.maxHp, player.hp + player.maxHp * 0.3);
+      box.opened = true;
+      box.options = null;
+      box.openerId = null;
+      this.boxes.delete(boxId);
+      return;
+    }
 
     if (option.upgradeIndex >= 0 && option.upgradeIndex < player.weapons.length) {
       // Upgrade existing weapon
@@ -317,7 +376,12 @@ export class World {
     this.waveTimer = Math.max(0, this.waveTimer - dt);
     if (this.bossTimer > 0) this.bossTimer = Math.max(0, this.bossTimer - dt);
 
-    if (this.waveTimer <= 0) {
+    // Boss waves end the moment the boss dies (not when the timer runs out).
+    if (this.isBossWave) {
+      if (!this.bossAlive()) {
+        this.advanceWave();
+      }
+    } else if (this.waveTimer <= 0) {
       this.advanceWave();
     }
 
@@ -332,9 +396,17 @@ export class World {
     this.updateSpawns(dt);
     this.updateEnemies(dt);
     this.updateProjectiles(dt);
+    this.updateZones(dt);
     this.resolveCombat(dt);
     this.updateRevive(dt);
     this.checkLossCondition();
+  }
+
+  private bossAlive(): boolean {
+    for (const e of this.enemies.values()) {
+      if (e.kind === 2) return true;
+    }
+    return false;
   }
 
   private processPendingBoxOpens(): void {
@@ -359,14 +431,17 @@ export class World {
 
   private spawnBoss(): void {
     const id = nextEnemyId++;
+    const tier = Math.floor(this.wave / 5); // 1 at wave 5, 2 at wave 10, ...
     this.enemies.set(id, {
       id,
       x: WORLD_WIDTH / 2,
       y: WORLD_HEIGHT * 0.25,
-      hp: 400,
+      hp: BOSS_BASE_HP + (tier - 1) * BOSS_HP_PER_TIER,
       kind: 2,
       vx: 0,
       vy: 0,
+      attackCd: BOSS_ZONE_INTERVAL,
+      slowTimer: 0,
     });
   }
 
@@ -484,6 +559,10 @@ export class World {
             orbit: true,
             orbitOffset: (existing.length / want) * Math.PI * 2,
             weaponKind: w.kind,
+            hostile: false,
+            armTimer: 0,
+            damage: damageFor(w),
+            angle: 0,
           });
           existing.push({
             id,
@@ -498,6 +577,10 @@ export class World {
             orbit: true,
             orbitOffset: (existing.length / want) * Math.PI * 2,
             weaponKind: w.kind,
+            hostile: false,
+            armTimer: 0,
+            damage: damageFor(w),
+            angle: 0,
           });
         }
       }
@@ -528,7 +611,25 @@ export class World {
       return;
     }
 
-    // Aimed weapons: target nearest enemy
+    if (w.kind === "mine") {
+      // Drop stationary mines around the player
+      for (let i = 0; i < count; i++) {
+        const spread = count > 1 ? (i - (count - 1) / 2) * 26 : 0;
+        const ang = Math.random() * Math.PI * 2;
+        const off = 18 + Math.random() * 14;
+        const mx = p.x + Math.cos(ang) * off + spread;
+        const my = p.y + Math.sin(ang) * off;
+        this.spawnMine(p, w, def.color, dmg, mx, my);
+      }
+      return;
+    }
+
+    if (w.kind === "chain") {
+      this.fireChain(p, w, count, dmg);
+      return;
+    }
+
+    // Aimed weapons (pulse/spread/lance/frost/homing): target nearest enemy
     const target = this.findNearestEnemy(p.x, p.y, AUTO_ATTACK_RANGE);
     if (!target) return;
 
@@ -540,6 +641,104 @@ export class World {
       const angle = baseAngle + offset;
       this.spawnProjectile(p, w, def.color, dmg, angle, def.projectileSpeed, def.projectileLifetime, def.piercing);
     }
+  }
+
+  private fireChain(p: InternalPlayer, w: InternalWeapon, links: number, dmg: number): void {
+    const def = WEAPON_DEFS[w.kind];
+    let from = { x: p.x, y: p.y };
+    let current = this.findNearestEnemy(from.x, from.y, AUTO_ATTACK_RANGE);
+    if (!current) return;
+    const hit = new Set<number>();
+    let damage = dmg;
+    for (let i = 0; i < links && current; i++) {
+      hit.add(current.id);
+      current.hp -= damage;
+      if (current.hp <= 0) {
+        const eid = current.id;
+        this.enemies.delete(eid);
+        if (Math.random() < BOX_DROP_CHANCE) this.spawnBox(current.x, current.y);
+      }
+      // Visual spark from `from` to current
+      this.spawnSpark(def.color, from.x, from.y, current.x, current.y);
+      from = { x: current.x, y: current.y };
+      damage *= 0.75;
+      current = this.findNearestEnemyExcluding(from.x, from.y, CHAIN_RANGE, hit);
+    }
+  }
+
+  private spawnSpark(color: number, x0: number, y0: number, x1: number, y1: number): void {
+    const angle = Math.atan2(y1 - y0, x1 - x0);
+    const dist = Math.hypot(x1 - x0, y1 - y0);
+    const id = nextProjectileId++;
+    this.projectiles.set(id, {
+      id,
+      x: x0,
+      y: y0,
+      vx: Math.cos(angle) * Math.max(400, dist * 8),
+      vy: Math.sin(angle) * Math.max(400, dist * 8),
+      ownerId: "spark",
+      color,
+      piercing: true,
+      lifetime: 0.12,
+      orbit: false,
+      orbitOffset: 0,
+      weaponKind: "chain",
+      hostile: false,
+      armTimer: 0,
+      damage: 0,
+      angle,
+    });
+  }
+
+  private spawnMine(
+    p: InternalPlayer,
+    w: InternalWeapon,
+    color: number,
+    damage: number,
+    x: number,
+    y: number,
+  ): void {
+    const id = nextProjectileId++;
+    this.projectiles.set(id, {
+      id,
+      x,
+      y,
+      vx: 0,
+      vy: 0,
+      ownerId: p.id,
+      color,
+      piercing: false,
+      lifetime: MINE_LIFETIME,
+      orbit: false,
+      orbitOffset: 0,
+      weaponKind: w.kind,
+      hostile: false,
+      armTimer: MINE_ARM_TIME,
+      damage,
+      angle: 0,
+    });
+    this.projectileDamage.set(id, damage);
+  }
+
+  private findNearestEnemyExcluding(
+    x: number,
+    y: number,
+    maxRange: number,
+    exclude: Set<number>,
+  ): InternalEnemy | null {
+    let best: InternalEnemy | null = null;
+    let bestDist = maxRange * maxRange;
+    for (const e of this.enemies.values()) {
+      if (exclude.has(e.id)) continue;
+      const dx = e.x - x;
+      const dy = e.y - y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestDist) {
+        best = e;
+        bestDist = d2;
+      }
+    }
+    return best;
   }
 
   private spawnProjectile(
@@ -566,6 +765,10 @@ export class World {
       orbit: false,
       orbitOffset: 0,
       weaponKind: w.kind,
+      hostile: false,
+      armTimer: 0,
+      damage,
+      angle,
     });
     // Stash damage on the projectile via a side map (avoids extending the wire type)
     this.projectileDamage.set(id, damage);
@@ -613,35 +816,75 @@ export class World {
     return best;
   }
 
+  private pickSpawnKind(): number {
+    const w = this.wave;
+    const weights: Array<[number, number]> = [
+      [1, 10], // Walker: always common
+      [3, w >= 3 ? 4 : 0], // Charger: from wave 3
+      [4, w >= 4 ? 3 : 0], // Brute: from wave 4
+      [5, w >= 6 ? 3 : 0], // Caster: from wave 6
+    ];
+    let total = 0;
+    for (const [, weight] of weights) total += weight;
+    if (total <= 0) return 1;
+    let r = Math.random() * total;
+    for (const [kind, weight] of weights) {
+      r -= weight;
+      if (r < 0) return kind;
+    }
+    return 1;
+  }
+
+  private spawnAtEdge(def: EnemyDef): void {
+    const id = nextEnemyId++;
+    const side = Math.floor(Math.random() * 4);
+    let x = 0;
+    let y = 0;
+    const r = def.radius;
+    if (side === 0) { x = Math.random() * WORLD_WIDTH; y = r; }
+    else if (side === 1) { x = WORLD_WIDTH - r; y = Math.random() * WORLD_HEIGHT; }
+    else if (side === 2) { x = Math.random() * WORLD_WIDTH; y = WORLD_HEIGHT - r; }
+    else { x = r; y = Math.random() * WORLD_HEIGHT; }
+    this.enemies.set(id, {
+      id,
+      x,
+      y,
+      hp: def.hp + this.wave * 2,
+      kind: def.kind,
+      vx: 0,
+      vy: 0,
+      attackCd: CASTER_FIRE_INTERVAL * (0.5 + Math.random()),
+      slowTimer: 0,
+    });
+  }
+
   private updateSpawns(dt: number): void {
     if (this.isBossWave) return;
+    if (this.enemies.size >= ENEMY_CAP) return;
     this.enemySpawnCooldown -= dt;
     if (this.enemySpawnCooldown <= 0) {
       // Spawn rate scales with wave
       this.enemySpawnCooldown = Math.max(0.3, ENEMY_SPAWN_INTERVAL - this.wave * 0.05);
-      const id = nextEnemyId++;
-      const side = Math.floor(Math.random() * 4);
-      let x = 0, y = 0;
-      if (side === 0) { x = Math.random() * WORLD_WIDTH; y = ENEMY_RADIUS; }
-      else if (side === 1) { x = WORLD_WIDTH - ENEMY_RADIUS; y = Math.random() * WORLD_HEIGHT; }
-      else if (side === 2) { x = Math.random() * WORLD_WIDTH; y = WORLD_HEIGHT - ENEMY_RADIUS; }
-      else { x = ENEMY_RADIUS; y = Math.random() * WORLD_HEIGHT; }
-      this.enemies.set(id, {
-        id,
-        x,
-        y,
-        hp: ENEMY_HP + this.wave * 2,
-        kind: 1,
-        vx: 0,
-        vy: 0,
-      });
+      const def = ENEMY_DEFS[this.pickSpawnKind()] ?? ENEMY_DEFS[1];
+      this.spawnAtEdge(def);
     }
   }
 
   private updateEnemies(dt: number): void {
     const players = [...this.players.values()].filter((p) => !p.downed);
-    if (players.length === 0) return;
+    if (players.length === 0) {
+      // No living players: drift to a stop
+      for (const e of this.enemies.values()) {
+        e.vx = 0;
+        e.vy = 0;
+      }
+      return;
+    }
     for (const e of this.enemies.values()) {
+      const def = ENEMY_DEFS[e.kind] ?? ENEMY_DEFS[1];
+      if (e.slowTimer > 0) e.slowTimer = Math.max(0, e.slowTimer - dt);
+
+      // Find nearest living player
       let target: InternalPlayer | null = null;
       let bestDist = Infinity;
       for (const p of players) {
@@ -654,14 +897,174 @@ export class World {
         }
       }
       if (!target) continue;
+
       const dx = target.x - e.x;
       const dy = target.y - e.y;
-      const d = Math.hypot(dx, dy) || 1;
-      const speed = ENEMY_SPEED + (e.kind === 2 ? 10 : 0);
-      e.vx = (dx / d) * speed;
-      e.vy = (dy / d) * speed;
+      const dist = Math.hypot(dx, dy) || 1;
+      const slow = e.slowTimer > 0 ? FROST_SLOW_FACTOR : 1;
+      const speed = (def.speed + (e.kind === 2 ? 0 : 0)) * slow;
+
+      if (def.ranged) {
+        // Caster: keep preferred range; fire on cooldown when in line of sight
+        e.attackCd -= dt;
+        if (dist > CASTER_PREF_RANGE + 20) {
+          e.vx = (dx / dist) * speed;
+          e.vy = (dy / dist) * speed;
+        } else if (dist < CASTER_PREF_RANGE - 40) {
+          e.vx = -(dx / dist) * speed;
+          e.vy = -(dy / dist) * speed;
+        } else {
+          // Strafe slowly
+          e.vx = (-dy / dist) * speed * 0.4;
+          e.vy = (dx / dist) * speed * 0.4;
+        }
+        if (e.attackCd <= 0 && dist <= CASTER_FIRE_RANGE) {
+          e.attackCd = CASTER_FIRE_INTERVAL;
+          this.spawnEnemyProjectile(e, target, ENEMY_PROJ_DAMAGE, ENEMY_PROJ_SPEED);
+        }
+      } else if (def.boss) {
+        // Boss: chase, periodically cast a damage zone on a player and summon adds
+        e.vx = (dx / dist) * speed;
+        e.vy = (dy / dist) * speed;
+        e.attackCd -= dt;
+        if (e.attackCd <= 0) {
+          e.attackCd = BOSS_ZONE_INTERVAL;
+          // Target the farther player to pressure both, else nearest
+          const zoneTarget = this.pickBossZoneTarget(target);
+          this.spawnZone(zoneTarget.x, zoneTarget.y);
+        }
+        this.bossSummonTimer = (this.bossSummonTimer ?? BOSS_SUMMON_INTERVAL) - dt;
+        if ((this.bossSummonTimer ?? 0) <= 0) {
+          this.bossSummonTimer = BOSS_SUMMON_INTERVAL;
+          this.summonAdds(e);
+        }
+      } else {
+        // Walker / Charger / Brute: chase nearest
+        e.vx = (dx / dist) * speed;
+        e.vy = (dy / dist) * speed;
+      }
+
       e.x += e.vx * dt;
       e.y += e.vy * dt;
+    }
+  }
+
+  private bossSummonTimer: number | undefined;
+
+  private pickBossZoneTarget(fallback: InternalPlayer): { x: number; y: number } {
+    const living = [...this.players.values()].filter((p) => !p.downed);
+    if (living.length <= 1) return { x: fallback.x, y: fallback.y };
+    // Pick the player farthest from the boss to spread pressure
+    let far = living[0];
+    let farDist = -1;
+    for (const p of living) {
+      const d = Math.hypot(p.x - WORLD_WIDTH / 2, p.y - WORLD_HEIGHT * 0.25);
+      if (d > farDist) {
+        farDist = d;
+        far = p;
+      }
+    }
+    return { x: far.x, y: far.y };
+  }
+
+  private summonAdds(boss: InternalEnemy): void {
+    const def = ENEMY_DEFS[3] ?? ENEMY_DEFS[1]; // summon chargers
+    for (let i = 0; i < BOSS_SUMMON_COUNT; i++) {
+      if (this.enemies.size >= ENEMY_CAP) break;
+      const id = nextEnemyId++;
+      const ang = Math.random() * Math.PI * 2;
+      const dist = 40 + Math.random() * 30;
+      this.enemies.set(id, {
+        id,
+        x: boss.x + Math.cos(ang) * dist,
+        y: boss.y + Math.sin(ang) * dist,
+        hp: def.hp + this.wave * 2,
+        kind: def.kind,
+        vx: 0,
+        vy: 0,
+        attackCd: CASTER_FIRE_INTERVAL,
+        slowTimer: 0,
+      });
+    }
+  }
+
+  private spawnEnemyProjectile(
+    from: InternalEnemy,
+    target: InternalPlayer,
+    damage: number,
+    speed: number,
+  ): void {
+    const angle = Math.atan2(target.y - from.y, target.x - from.x);
+    const id = nextProjectileId++;
+    this.projectiles.set(id, {
+      id,
+      x: from.x,
+      y: from.y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      ownerId: `enemy:${from.id}`,
+      color: 0x22d3ee,
+      piercing: false,
+      lifetime: ENEMY_PROJ_LIFETIME,
+      orbit: false,
+      orbitOffset: 0,
+      weaponKind: "pulse",
+      hostile: true,
+      armTimer: 0,
+      damage,
+      angle,
+    });
+  }
+
+  private spawnZone(x: number, y: number): void {
+    const id = nextZoneId++;
+    // Keep zones within bounds
+    const cx = Math.max(ZONE_RADIUS, Math.min(WORLD_WIDTH - ZONE_RADIUS, x));
+    const cy = Math.max(ZONE_RADIUS, Math.min(WORLD_HEIGHT - ZONE_RADIUS, y));
+    this.zones.set(id, {
+      id,
+      x: cx,
+      y: cy,
+      radius: ZONE_RADIUS,
+      telegraph: ZONE_TELEGRAPH,
+      active: false,
+      duration: ZONE_DURATION,
+      dps: ZONE_DPS,
+      color: ZONE_COLOR,
+    });
+  }
+
+  private updateZones(dt: number): void {
+    for (const [id, z] of [...this.zones]) {
+      if (!z.active) {
+        z.telegraph -= dt;
+        if (z.telegraph <= 0) {
+          z.active = true;
+          z.telegraph = 0;
+        }
+        continue;
+      }
+      z.duration -= dt;
+      if (z.duration <= 0) {
+        this.zones.delete(id);
+        continue;
+      }
+      // Damage living players standing in the zone (i-frames grant safety)
+      for (const p of this.players.values()) {
+        if (p.downed || p.iFrames > 0) continue;
+        const dx = p.x - z.x;
+        const dy = p.y - z.y;
+        if (dx * dx + dy * dy <= z.radius * z.radius) {
+          p.hp -= z.dps * dt;
+          if (p.hp <= 0) {
+            p.hp = 0;
+            p.downed = true;
+            p.bufferedInput = { mx: 0, my: 0, charging: false };
+            p.chargeProgress = 0;
+            p.charging = false;
+          }
+        }
+      }
     }
   }
 
@@ -672,69 +1075,169 @@ export class World {
         const owner = this.players.get(pr.ownerId);
         if (!owner) {
           this.projectiles.delete(id);
+          this.projectileDamage.delete(id);
           continue;
         }
         const w = owner.weapons.find((w) => w.kind === pr.weaponKind);
         if (!w) {
           this.projectiles.delete(id);
+          this.projectileDamage.delete(id);
           continue;
         }
         const angle = w.orbitPhase + pr.orbitOffset;
         pr.x = owner.x + Math.cos(angle) * ORBIT_RADIUS;
         pr.y = owner.y + Math.sin(angle) * ORBIT_RADIUS;
-        // Orbit projectiles deal damage on contact (handled in resolveCombat)
         continue;
       }
 
-      pr.x += pr.vx * dt;
-      pr.y += pr.vy * dt;
-      pr.lifetime -= dt;
-      if (
-        pr.lifetime <= 0 ||
-        pr.x < 0 || pr.x > WORLD_WIDTH ||
-        pr.y < 0 || pr.y > WORLD_HEIGHT
-      ) {
-        this.projectiles.delete(id);
-        this.projectileDamage.delete(id);
+      if (pr.hostile) {
+        this.updateHostileProjectile(id, pr, dt);
         continue;
       }
-      // Check enemy collisions
-      let hit = false;
-      for (const [eid, e] of [...this.enemies]) {
-        const dx = e.x - pr.x;
-        const dy = e.y - pr.y;
-        const r = ENEMY_RADIUS + PROJECTILE_RADIUS;
-        if (dx * dx + dy * dy < r * r) {
-          e.hp -= this.projectileDamage.get(id) ?? PROJECTILE_RADIUS; // fallback
-          hit = true;
-          if (e.hp <= 0) {
-            this.enemies.delete(eid);
-            const dropChance = e.kind === 2 ? BOSS_DROP_CHANCE : BOX_DROP_CHANCE;
-            if (Math.random() < dropChance) {
-              this.spawnBox(e.x, e.y);
-            }
+
+      if (pr.weaponKind === "mine") {
+        this.updateMine(id, pr, dt);
+        continue;
+      }
+
+      if (pr.weaponKind === "homing") {
+        this.steerHoming(pr, dt);
+      }
+
+      this.updatePlayerProjectile(id, pr, dt);
+    }
+  }
+
+  private updateHostileProjectile(id: number, pr: InternalProjectile, dt: number): void {
+    pr.x += pr.vx * dt;
+    pr.y += pr.vy * dt;
+    pr.lifetime -= dt;
+    if (pr.lifetime <= 0 || pr.x < 0 || pr.x > WORLD_WIDTH || pr.y < 0 || pr.y > WORLD_HEIGHT) {
+      this.projectiles.delete(id);
+      return;
+    }
+    for (const p of this.players.values()) {
+      if (p.downed || p.iFrames > 0) continue;
+      const dx = p.x - pr.x;
+      const dy = p.y - pr.y;
+      const r = PLAYER_RADIUS + PROJECTILE_RADIUS;
+      if (dx * dx + dy * dy < r * r) {
+        p.hp -= pr.damage;
+        if (p.hp <= 0) {
+          p.hp = 0;
+          p.downed = true;
+          p.bufferedInput = { mx: 0, my: 0, charging: false };
+          p.chargeProgress = 0;
+          p.charging = false;
+        }
+        this.projectiles.delete(id);
+        return;
+      }
+    }
+  }
+
+  private updatePlayerProjectile(id: number, pr: InternalProjectile, dt: number): void {
+    pr.x += pr.vx * dt;
+    pr.y += pr.vy * dt;
+    pr.lifetime -= dt;
+    if (
+      pr.lifetime <= 0 ||
+      pr.x < 0 || pr.x > WORLD_WIDTH ||
+      pr.y < 0 || pr.y > WORLD_HEIGHT
+    ) {
+      this.projectiles.delete(id);
+      this.projectileDamage.delete(id);
+      return;
+    }
+    for (const [eid, e] of [...this.enemies]) {
+      const dx = e.x - pr.x;
+      const dy = e.y - pr.y;
+      const r = (ENEMY_DEFS[e.kind]?.radius ?? ENEMY_RADIUS) + PROJECTILE_RADIUS;
+      if (dx * dx + dy * dy < r * r) {
+        e.hp -= pr.damage;
+        if (pr.weaponKind === "frost") e.slowTimer = FROST_SLOW_DURATION;
+        if (e.hp <= 0) {
+          this.enemies.delete(eid);
+          const dropChance = e.kind === 2 ? BOSS_DROP_CHANCE : BOX_DROP_CHANCE;
+          if (Math.random() < dropChance) {
+            this.spawnBox(e.x, e.y);
           }
-          if (!pr.piercing) {
-            this.projectiles.delete(id);
-            this.projectileDamage.delete(id);
-            break;
+        }
+        if (!pr.piercing) {
+          this.projectiles.delete(id);
+          this.projectileDamage.delete(id);
+          break;
+        }
+      }
+    }
+  }
+
+  private steerHoming(pr: InternalProjectile, dt: number): void {
+    const target = this.findNearestEnemy(pr.x, pr.y, AUTO_ATTACK_RANGE * 2);
+    if (!target) return;
+    const desired = Math.atan2(target.y - pr.y, target.x - pr.x);
+    // Rotate pr.angle toward desired by at most HOMING_TURN_RATE * dt
+    let diff = desired - pr.angle;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    const maxTurn = HOMING_TURN_RATE * dt;
+    pr.angle += Math.max(-maxTurn, Math.min(maxTurn, diff));
+    const speed = Math.hypot(pr.vx, pr.vy) || 1;
+    pr.vx = Math.cos(pr.angle) * speed;
+    pr.vy = Math.sin(pr.angle) * speed;
+  }
+
+  private updateMine(id: number, pr: InternalProjectile, dt: number): void {
+    pr.armTimer = Math.max(0, pr.armTimer - dt);
+    pr.lifetime -= dt;
+    if (pr.lifetime <= 0) {
+      this.projectiles.delete(id);
+      this.projectileDamage.delete(id);
+      return;
+    }
+    if (pr.armTimer > 0) return;
+    // Detonate when an enemy is within trigger range
+    for (const e of this.enemies.values()) {
+      const dx = e.x - pr.x;
+      const dy = e.y - pr.y;
+      if (dx * dx + dy * dy <= MINE_TRIGGER_RANGE * MINE_TRIGGER_RANGE) {
+        this.detonateMine(pr);
+        this.projectiles.delete(id);
+        this.projectileDamage.delete(id);
+        return;
+      }
+    }
+  }
+
+  private detonateMine(pr: InternalProjectile): void {
+    for (const [eid, e] of [...this.enemies]) {
+      const dx = e.x - pr.x;
+      const dy = e.y - pr.y;
+      if (dx * dx + dy * dy <= MINE_BLAST_RADIUS * MINE_BLAST_RADIUS) {
+        e.hp -= pr.damage;
+        if (e.hp <= 0) {
+          this.enemies.delete(eid);
+          const dropChance = e.kind === 2 ? BOSS_DROP_CHANCE : BOX_DROP_CHANCE;
+          if (Math.random() < dropChance) {
+            this.spawnBox(e.x, e.y);
           }
         }
       }
-      if (hit && !pr.piercing) continue;
     }
   }
 
   private resolveCombat(dt: number): void {
     // Enemy contact damage
     for (const e of this.enemies.values()) {
+      const def = ENEMY_DEFS[e.kind] ?? ENEMY_DEFS[1];
+      if (def.damage <= 0) continue;
       for (const p of this.players.values()) {
         if (p.downed || p.iFrames > 0) continue;
         const dx = p.x - e.x;
         const dy = p.y - e.y;
-        const r = PLAYER_RADIUS + ENEMY_RADIUS;
+        const r = PLAYER_RADIUS + def.radius;
         if (dx * dx + dy * dy < r * r) {
-          p.hp -= ENEMY_DAMAGE * dt;
+          p.hp -= def.damage * dt;
           if (p.hp <= 0) {
             p.hp = 0;
             p.downed = true;
@@ -748,11 +1251,11 @@ export class World {
     // Orbit projectile contact damage (projectiles that persist)
     for (const [id, pr] of this.projectiles) {
       if (!pr.orbit) continue;
-      const dmg = this.projectileDamage.get(id) ?? WEAPON_DEFS.orbit.baseDamage;
+      const dmg = pr.damage || this.projectileDamage.get(id) || WEAPON_DEFS.orbit.baseDamage;
       for (const [eid, e] of [...this.enemies]) {
         const dx = e.x - pr.x;
         const dy = e.y - pr.y;
-        const r = ENEMY_RADIUS + PROJECTILE_RADIUS;
+        const r = (ENEMY_DEFS[e.kind]?.radius ?? ENEMY_RADIUS) + PROJECTILE_RADIUS;
         if (dx * dx + dy * dy < r * r) {
           e.hp -= dmg * dt * 4; // orbit ticks continuously, scale down per-frame
           if (e.hp <= 0) {
@@ -840,8 +1343,10 @@ export class World {
       orbit: pr.orbit,
       orbitOffset: pr.orbitOffset,
       weaponKind: pr.weaponKind,
+      hostile: pr.hostile,
     }));
     const boxes: BoxState[] = [...this.boxes.values()];
+    const zones: ZoneState[] = [...this.zones.values()];
     return {
       t: this.time,
       tick: this.tick,
@@ -849,6 +1354,7 @@ export class World {
       enemies,
       projectiles,
       boxes,
+      zones,
       wave: this.wave,
       waveTimer: this.waveTimer,
       isBossWave: this.isBossWave,
@@ -880,16 +1386,25 @@ export class World {
     }
     this.enemies.clear();
     for (const e of snap.enemies) {
-      this.enemies.set(e.id, { ...e, vx: 0, vy: 0 });
+      this.enemies.set(e.id, { ...e, vx: 0, vy: 0, attackCd: 0, slowTimer: 0 });
     }
     this.projectiles.clear();
     this.projectileDamage.clear();
     for (const pr of snap.projectiles) {
-      this.projectiles.set(pr.id, { ...pr });
+      this.projectiles.set(pr.id, {
+        ...pr,
+        armTimer: 0,
+        damage: 0,
+        angle: Math.atan2(pr.vy, pr.vx),
+      });
     }
     this.boxes.clear();
     for (const b of snap.boxes) {
       this.boxes.set(b.id, { ...b });
+    }
+    this.zones.clear();
+    for (const z of snap.zones) {
+      this.zones.set(z.id, { ...z });
     }
   }
 
@@ -942,6 +1457,10 @@ export class World {
     return [...this.boxes.values()];
   }
 
+  getZones(): ZoneState[] {
+    return [...this.zones.values()];
+  }
+
   getWaveInfo(): { wave: number; waveTimer: number; isBossWave: boolean; bossTimer: number } {
     return {
       wave: this.wave,
@@ -964,4 +1483,8 @@ export {
   WORLD_WIDTH,
   WORLD_HEIGHT,
   REVIVE_RANGE,
+  ENEMY_DEFS,
+  ZONE_COLOR,
+  ZONE_RADIUS,
+  MINE_BLAST_RADIUS,
 };
