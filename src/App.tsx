@@ -7,7 +7,7 @@ import Phaser from "phaser";
 import { NetClient } from "./net/NetClient";
 import { GameScene } from "./sim/GameScene";
 import { bridge } from "./bridge/GameBridge";
-import { WORLD_WIDTH, WORLD_HEIGHT } from "./shared/config";
+import { VIEW_WIDTH, VIEW_HEIGHT } from "./shared/config";
 import type { RunStatus, WeaponPickOption } from "./shared/types";
 import { Lobby } from "./ui/Lobby";
 import { Hud } from "./ui/Hud";
@@ -26,6 +26,7 @@ export function App() {
   const [inGame, setInGame] = useState(false);
   const [boxMenu, setBoxMenu] = useState<BoxMenuState | null>(null);
   const [runEnd, setRunEnd] = useState<{ status: RunStatus; runTime: number; wave: number } | null>(null);
+  const [crtHit, setHit] = useState(false);
 
   const netRef = useRef<NetClient | null>(null);
   if (!netRef.current) netRef.current = new NetClient();
@@ -39,6 +40,11 @@ export function App() {
   // Latest snapshot for the end screen
   const lastSnapshotRef = useRef<{ runTime: number; wave: number } | null>(null);
 
+  // Effective HP tracking: when the local player's HP+shield drops, pulse the CRT.
+  const localIdRef = useRef<string | null>(null);
+  const prevHpRef = useRef<number | null>(null);
+  const hitTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   // Wire NetClient -> bridge
   useEffect(() => {
     const net = netRef.current!;
@@ -46,10 +52,10 @@ export function App() {
       bridge.emit({ type: "connection", state, message });
     });
 
-    // Both clients start the game on the first authoritative snapshot from the
-    // server. No hello handshake, no host role.
+    // Both clients start the game only once the server says the run has started
+    // (both players joined). Before that, P1 stays in the lobby waiting for P2.
     const offLobby = net.onMessage((msg) => {
-      if (msg.kind === "snapshot") {
+      if (msg.kind === "snapshot" && msg.snapshot.started) {
         if (!inGameRef.current) startGame();
       }
     });
@@ -94,18 +100,34 @@ export function App() {
     };
   }, []);
 
-  // Track latest snapshot for end-screen stats
+  // Track latest snapshot for end-screen stats, and pulse the CRT overlay on hit.
   useEffect(() => {
     const off = bridge.on("snapshot", (e) => {
       lastSnapshotRef.current = {
         runTime: e.snapshot.runTime,
         wave: e.snapshot.wave,
       };
+      const me = localIdRef.current
+        ? e.snapshot.players.find((p) => p.id === localIdRef.current)
+        : null;
+      if (me) {
+        const effective = me.hp + me.shieldHp;
+        if (prevHpRef.current !== null && effective < prevHpRef.current - 0.5) {
+          triggerHitPulse();
+        }
+        prevHpRef.current = effective;
+      }
     });
     return () => {
       off();
     };
   }, []);
+
+  function triggerHitPulse() {
+    setHit(true);
+    if (hitTimeoutRef.current) clearTimeout(hitTimeoutRef.current);
+    hitTimeoutRef.current = setTimeout(() => setHit(false), 240);
+  }
 
   // Box menu events from Phaser
   useEffect(() => {
@@ -156,7 +178,11 @@ export function App() {
     const off = bridge.on("connection", (e) => {
       if (e.state === "connected") {
         const id = netRef.current?.getLocalPeerId() ?? null;
-        if (id) bridge.emit({ type: "localPeerId", peerId: id });
+        if (id) {
+          localIdRef.current = id;
+          prevHpRef.current = null;
+          bridge.emit({ type: "localPeerId", peerId: id });
+        }
         const code = netRef.current?.getRoomCode() ?? null;
         if (code) bridge.emit({ type: "roomCode", code });
       }
@@ -178,8 +204,8 @@ export function App() {
       gameRef.current = new Phaser.Game({
         type: Phaser.AUTO,
         parent: containerRef.current,
-        width: WORLD_WIDTH,
-        height: WORLD_HEIGHT,
+        width: VIEW_WIDTH,
+        height: VIEW_HEIGHT,
         backgroundColor: "#0a0a0b",
         scale: {
           mode: Phaser.Scale.FIT,
@@ -247,7 +273,9 @@ export function App() {
       />
 
       {/* CRT retro overlay: scanlines + vignette + aberration. Above canvas, below menus. */}
-      {phase === "in-game" && <div className="crt-overlay" aria-hidden="true" />}
+      {phase === "in-game" && (
+        <div className={`crt-overlay${crtHit ? " crt-hit" : ""}`} aria-hidden="true" />
+      )}
 
       {phase === "in-game" && <Hud />}
       {phase === "in-game" && boxMenu && (

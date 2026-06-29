@@ -3,7 +3,7 @@
 // A player's loadout can hold up to MAX_WEAPONS; each can be leveled up to
 // MAX_WEAPON_LEVEL for incremental upgrades.
 
-import { ORBIT_RADIUS } from "../shared/config";
+import * as C from "../shared/config";
 
 export type WeaponKind =
   | "pulse" // single accurate shot at nearest enemy
@@ -15,6 +15,16 @@ export type WeaponKind =
   | "frost" // bolt that slows enemies on hit
   | "homing" // missiles that steer toward enemies
   | "mine"; // drops a proximity mine that explodes in an AoE
+
+/** Visual shape of a weapon's projectile (Stage 1). The renderer switches on this. */
+export type ProjectileShape =
+  | "circle"
+  | "triangle"
+  | "square"
+  | "diamond"
+  | "star"
+  | "rect"
+  | "spark";
 
 export interface WeaponDef {
   kind: WeaponKind;
@@ -30,6 +40,10 @@ export interface WeaponDef {
   orbit: boolean; // projectile orbits owner instead of flying
   /** Targeting range used to acquire a nearest enemy and drawn as the range ring. */
   range: number;
+  /** Distance at which the weapon acquires a target (often == range). Stage 1. */
+  activationRange: number;
+  /** Visual projectile shape. Stage 1. */
+  shape: ProjectileShape;
   description: string;
 }
 
@@ -47,6 +61,8 @@ export const WEAPON_DEFS: Record<WeaponKind, WeaponDef> = {
     piercing: false,
     orbit: false,
     range: 340,
+    activationRange: 340,
+    shape: "circle",
     description: "Single accurate bolt. Reliable damage at the nearest threat.",
   },
   spread: {
@@ -62,6 +78,8 @@ export const WEAPON_DEFS: Record<WeaponKind, WeaponDef> = {
     piercing: false,
     orbit: false,
     range: 300,
+    activationRange: 300,
+    shape: "triangle",
     description: "Three bolts in a fan. Closer enemies take all three hits.",
   },
   orbit: {
@@ -76,7 +94,9 @@ export const WEAPON_DEFS: Record<WeaponKind, WeaponDef> = {
     spread: 0,
     piercing: true,
     orbit: true,
-    range: ORBIT_RADIUS + 16,
+    range: C.ORBIT_RADIUS + 16,
+    activationRange: C.ORBIT_RADIUS + 16,
+    shape: "diamond",
     description: "Two shards orbit you, damaging anything they touch.",
   },
   lance: {
@@ -92,6 +112,8 @@ export const WEAPON_DEFS: Record<WeaponKind, WeaponDef> = {
     piercing: true,
     orbit: false,
     range: 640,
+    activationRange: 540,
+    shape: "rect",
     description: "Long-range piercing shot. Hits every enemy in its line.",
   },
   nova: {
@@ -107,6 +129,8 @@ export const WEAPON_DEFS: Record<WeaponKind, WeaponDef> = {
     piercing: false,
     orbit: false,
     range: 260,
+    activationRange: 260,
+    shape: "star",
     description: "Radial burst of twelve shards. Hits everything around you.",
   },
   chain: {
@@ -122,6 +146,8 @@ export const WEAPON_DEFS: Record<WeaponKind, WeaponDef> = {
     piercing: true,
     orbit: false,
     range: 420,
+    activationRange: 420,
+    shape: "spark",
     description: "Lightning arcs from the nearest enemy to others nearby.",
   },
   frost: {
@@ -137,6 +163,8 @@ export const WEAPON_DEFS: Record<WeaponKind, WeaponDef> = {
     piercing: false,
     orbit: false,
     range: 320,
+    activationRange: 320,
+    shape: "square",
     description: "Chilled bolt that slows enemies it strikes.",
   },
   homing: {
@@ -152,6 +180,8 @@ export const WEAPON_DEFS: Record<WeaponKind, WeaponDef> = {
     piercing: false,
     orbit: false,
     range: 480,
+    activationRange: 480,
+    shape: "triangle",
     description: "Twin missiles that steer toward the nearest threat.",
   },
   mine: {
@@ -167,6 +197,8 @@ export const WEAPON_DEFS: Record<WeaponKind, WeaponDef> = {
     piercing: false,
     orbit: false,
     range: 220,
+    activationRange: C.MINE_TRIGGER_RANGE,
+    shape: "circle",
     description: "Drops a mine that bursts, damaging everything nearby.",
   },
 };

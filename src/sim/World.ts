@@ -16,8 +16,10 @@ import type {
   PlayerInput,
   WeaponPickOption,
   RunStatus,
+  CameraState,
 } from "../shared/types";
 import type { WeaponKind } from "./weapons";
+import type { CurseKind } from "../shared/types";
 import {
   WEAPON_DEFS,
   ALL_WEAPON_KINDS,
@@ -27,6 +29,12 @@ import {
 import {
   WORLD_WIDTH,
   WORLD_HEIGHT,
+  VIEW_WIDTH,
+  VIEW_HEIGHT,
+  CAMERA_SCROLL_SPEED,
+  VOID_DPS,
+  VOID_PULL_ACCEL,
+  WORLD_PADDING,
   PLAYER_RADIUS,
   PLAYER_MAX_HP,
   PLAYER_MAX_MANA,
@@ -45,6 +53,10 @@ import {
   ENEMY_COLOR,
   ENEMY_DEFS,
   EnemyDef,
+  EARLY_GAME_WAVES,
+  ENEMY_HP_PER_WAVE_EARLY,
+  ENEMY_HP_PER_WAVE_LATE,
+  ENEMY_SPAWN_ACCEL,
   BOSS_BASE_HP,
   BOSS_HP_PER_TIER,
   CASTER_FIRE_INTERVAL,
@@ -70,6 +82,8 @@ import {
   CHAIN_RANGE,
   HOMING_TURN_RATE,
   ENEMY_CAP,
+  ENEMY_SEPARATION_GAIN,
+  ENEMY_SEPARATION_MAX,
   PROJECTILE_RADIUS,
   AUTO_ATTACK_RANGE,
   BOX_RADIUS,
@@ -85,6 +99,17 @@ import {
   DASH_DURATION,
   DASH_COOLDOWN,
   DASH_I_FRAMES,
+  DASH_RANGE_BONUS,
+  DASH_CD_REDUCTION,
+  DASH_CD_MIN,
+  DASH_TRAIL_DPS,
+  DASH_TRAIL_DURATION,
+  DASH_TRAIL_RADIUS,
+  DASH_TRAIL_COLOR,
+  CURSE_SPAWN_MULT,
+  CURSE_ENEMY_SPEED_MULT,
+  CURSE_MAX_HP_MULT,
+  CURSE_SCROLL_SPEED_MULT,
   PLAYER_MAX_SHIELD,
   SHIELD_PER_PICKUP,
   OBSTACLE_BLOCK_COLOR,
@@ -124,6 +149,10 @@ interface InternalPlayer extends PlayerState {
   /** Accumulated damage within the rolling window since last DPS recompute. */
   damageAccum: number;
   damageWindowStart: number;
+  /** Stage 3 dash trail bookkeeping. */
+  dashStartX: number;
+  dashStartY: number;
+  lastTrailPos: { x: number; y: number } | null;
 }
 
 interface InternalEnemy extends EnemyState {
@@ -153,6 +182,7 @@ interface InternalZone {
   duration: number;
   dps: number;
   color: number;
+  ownerId?: string;
 }
 
 interface InternalBox {
@@ -214,12 +244,17 @@ function makePlayer(id: string, color: number, x: number, y: number): InternalPl
     color,
     bufferedInput: { mx: 0, my: 0, charging: false, dashPressed: false },
     weapons: [{ kind: "pulse", level: 1, cooldown: 0, orbitPhase: 0 }],
+    dashMods: { range: 0, trail: 0, cooldown: 0 },
+    curses: [],
     pendingOpenBoxId: null,
     facingX: 1,
     facingY: 0,
     damageLog: [],
     damageAccum: 0,
     damageWindowStart: 0,
+    dashStartX: 0,
+    dashStartY: 0,
+    lastTrailPos: null,
   };
 }
 
@@ -239,6 +274,52 @@ function countFor(w: InternalWeapon): number {
   return def.projectileCount + Math.floor((w.level - 1) / 2);
 }
 
+/** Per-wave HP bonus with a gentle early-game curve (Stage 1). */
+function enemyHpBonus(wave: number): number {
+  if (wave <= EARLY_GAME_WAVES) return wave * ENEMY_HP_PER_WAVE_EARLY;
+  return EARLY_GAME_WAVES * ENEMY_HP_PER_WAVE_EARLY + (wave - EARLY_GAME_WAVES) * ENEMY_HP_PER_WAVE_LATE;
+}
+
+  /** Stage 3: dash cooldown shrinks with each cooldown level, floored. */
+function effectiveDashCooldown(cooldownLevel: number): number {
+  const mult = Math.max(DASH_CD_MIN, 1 - cooldownLevel * DASH_CD_REDUCTION);
+  return DASH_COOLDOWN * mult;
+}
+
+/** Stage 3 curse magnitudes (applied per active curse). */
+const CURSE_MULTS: Record<CurseKind, number> = {
+  spawn: CURSE_SPAWN_MULT,
+  speed: CURSE_ENEMY_SPEED_MULT,
+  hp: CURSE_MAX_HP_MULT,
+  scroll: CURSE_SCROLL_SPEED_MULT,
+};
+
+/** A set of 8 scroll directions (radians) the camera cycles through per wave. */
+const SCROLL_DIRS = [
+  0, // right
+  Math.PI / 2, // down
+  Math.PI, // left
+  (3 * Math.PI) / 2, // up
+  Math.PI / 4, // down-right
+  (3 * Math.PI) / 4, // down-left
+  (5 * Math.PI) / 4, // up-left
+  (7 * Math.PI) / 4, // up-right
+];
+
+/** Build the initial camera: centered on the world, scrolling right. */
+function makeCamera(): CameraState {
+  const dir = SCROLL_DIRS[0];
+  return {
+    x: (WORLD_WIDTH - VIEW_WIDTH) / 2,
+    y: (WORLD_HEIGHT - VIEW_HEIGHT) / 2,
+    w: VIEW_WIDTH,
+    h: VIEW_HEIGHT,
+    vx: Math.cos(dir) * CAMERA_SCROLL_SPEED,
+    vy: Math.sin(dir) * CAMERA_SCROLL_SPEED,
+    dir,
+  };
+}
+
 export class World {
   private players: Map<string, InternalPlayer> = new Map();
   private enemies: Map<number, InternalEnemy> = new Map();
@@ -256,17 +337,23 @@ export class World {
   private enemySpawnCooldown = ENEMY_SPAWN_INTERVAL;
   private healthPackCooldown = HEALTH_PACK_SPAWN_INTERVAL;
   private runStatus: RunStatus = "playing";
+  /** Latched once both players have joined; the sim won't step until then. */
+  private started = false;
+  /** Auto-scrolling safe-zone camera (Stage 2). */
+  private camera: CameraState = makeCamera();
 
   addHostPlayer(id: string): void {
     if (this.players.has(id)) return;
     const p = makePlayer(id, PLAYER_COLORS.host, WORLD_WIDTH * 0.35, WORLD_HEIGHT * 0.5);
     this.players.set(id, p);
+    if (this.players.size >= 2) this.started = true;
   }
 
   addGuestPlayer(id: string): void {
     if (this.players.has(id)) return;
     const p = makePlayer(id, PLAYER_COLORS.guest, WORLD_WIDTH * 0.65, WORLD_HEIGHT * 0.5);
     this.players.set(id, p);
+    if (this.players.size >= 2) this.started = true;
   }
 
   removePlayer(id: string): void {
@@ -379,46 +466,74 @@ export class World {
     const option = box.options[optionIndex];
     if (!option) return;
 
-    // Heal sentinel (resultingLevel === 0): restore HP and close the box.
+    this.applyPickOption(player.id, option);
+    box.opened = true;
+    box.options = null;
+    box.openerId = null;
+    // Remove box from world after a short delay (next step removes opened boxes)
+    this.boxes.delete(boxId);
+  }
+
+  /**
+   * Apply a single pick option to a player (Stage 3: also public for tests).
+   * Dispatches on the option's flags: heal sentinel, shield, dash mod, cursed,
+   * or a plain weapon upgrade/new weapon.
+   */
+  applyPickOption(playerId: string, option: WeaponPickOption): void {
+    const player = this.players.get(playerId);
+    if (!player) return;
+    // Heal sentinel (resultingLevel === 0): restore HP.
     if (option.resultingLevel === 0) {
       player.hp = Math.min(player.maxHp, player.hp + player.maxHp * 0.3);
-      box.opened = true;
-      box.options = null;
-      box.openerId = null;
-      this.boxes.delete(boxId);
       return;
     }
 
     // Shield defensive item (option.shield set): top up the absorb layer.
     if (option.shield !== undefined) {
       player.shieldHp = Math.min(player.maxShield, player.shieldHp + option.shield);
-      box.opened = true;
-      box.options = null;
-      box.openerId = null;
-      this.boxes.delete(boxId);
       return;
     }
 
+    // Stage 3: dash upgrade (option.dashMod set). Increments that mod's level.
+    if (option.dashMod !== undefined) {
+      player.dashMods[option.dashMod] = Math.min(3, (player.dashMods[option.dashMod] ?? 0) + 1);
+      return;
+    }
+
+    // Stage 3: cursed option — apply the curse, then grant the strong positive.
+    if (option.curse !== undefined) {
+      this.applyCurse(player, option.curse);
+    }
+
+    const bonus = option.bonusLevels ?? 0;
     if (option.upgradeIndex >= 0 && option.upgradeIndex < player.weapons.length) {
-      // Upgrade existing weapon
+      // Upgrade existing weapon (+ bonus levels for cursed picks)
       player.weapons[option.upgradeIndex].level = Math.min(
         MAX_WEAPON_LEVEL,
-        player.weapons[option.upgradeIndex].level + 1,
+        player.weapons[option.upgradeIndex].level + 1 + bonus,
       );
     } else if (player.weapons.length < MAX_WEAPONS) {
-      // Add new weapon
+      // Add new weapon (starting at level 1 + bonus for cursed picks)
       player.weapons.push({
         kind: option.kind,
-        level: 1,
+        level: Math.min(MAX_WEAPON_LEVEL, 1 + bonus),
         cooldown: 0,
         orbitPhase: 0,
       });
     }
-    box.opened = true;
-    box.options = null;
-    box.openerId = null;
-    // Remove box from world after a short delay (next step removes opened boxes)
-    this.boxes.delete(boxId);
+  }
+
+  /** Stage 3: apply a run-long curse to a player. */
+  private applyCurse(player: InternalPlayer, curse: CurseKind): void {
+    if (player.curses.includes(curse)) return; // no double-stacking the same curse
+    player.curses.push(curse);
+    if (curse === "hp") {
+      player.maxHp = Math.max(10, Math.floor(player.maxHp * CURSE_MULTS.hp));
+      player.hp = Math.min(player.hp, Math.floor(player.hp * CURSE_MULTS.hp));
+    } else if (curse === "scroll") {
+      // Re-apply camera speed so the curse takes effect immediately.
+      this.setScrollDirection(this.camera.dir);
+    }
   }
 
   /** Player cancelled their box menu without choosing. */
@@ -433,6 +548,24 @@ export class World {
     const pool: WeaponKind[] = [...ALL_WEAPON_KINDS];
     const options: WeaponPickOption[] = [];
     const usedKinds = new Set<WeaponKind>();
+
+    // Fully maxed loadout (no upgrades, no room): offer a deterministic heal,
+    // plus a shield top-up if there's room for one. This keeps the box useful
+    // and avoids random dash/cursed picks displacing the heal sentinel.
+    const hasUpgrade = player.weapons.some((w) => w.level < MAX_WEAPON_LEVEL);
+    const hasRoom = player.weapons.length < MAX_WEAPONS;
+    if (!hasUpgrade && !hasRoom) {
+      if (player.shieldHp < player.maxShield) {
+        options.push({
+          kind: "pulse",
+          upgradeIndex: -1,
+          resultingLevel: -1,
+          shield: SHIELD_PER_PICKUP,
+        });
+      }
+      options.push({ kind: "pulse", upgradeIndex: -1, resultingLevel: 0 });
+      return options;
+    }
 
     // For each of 3 options, prefer upgrades to existing weapons if possible,
     // otherwise offer new weapons.
@@ -475,9 +608,52 @@ export class World {
         });
       }
 
+      // Stage 3: dash upgrade option. Offered sometimes, capped at level 3 each.
+      if (Math.random() < 0.3) {
+        const possibleMods: Array<"range" | "trail" | "cooldown"> = (
+          ["range", "trail", "cooldown"] as const
+        ).filter((m) => player.dashMods[m] < 3);
+        if (possibleMods.length > 0) {
+          const m = possibleMods[Math.floor(Math.random() * possibleMods.length)];
+          candidates.push({
+            kind: "pulse", // placeholder; `dashMod` flag drives rendering + apply
+            upgradeIndex: -1,
+            resultingLevel: -2, // -2 = dash-mod sentinel
+            dashMod: m,
+          });
+        }
+      }
+
+      // Stage 3: cursed option — a strong positive (+2 bonus levels) bundled
+      // with a run-long curse. Only offered if a curse isn't already active.
+      if (Math.random() < 0.18) {
+        const positives: WeaponPickOption[] = [];
+        for (let idx = 0; idx < player.weapons.length; idx++) {
+          const w = player.weapons[idx];
+          if (w.level + 3 <= MAX_WEAPON_LEVEL) {
+            positives.push({ kind: w.kind, upgradeIndex: idx, resultingLevel: w.level + 3, bonusLevels: 2 });
+          }
+        }
+        if (player.weapons.length < MAX_WEAPONS) {
+          for (const kind of pool) {
+            if (player.weapons.some((w) => w.kind === kind)) continue;
+            positives.push({ kind, upgradeIndex: -1, resultingLevel: 3, bonusLevels: 2 });
+          }
+        }
+        const curses: CurseKind[] = (["spawn", "speed", "hp", "scroll"] as const).filter(
+          (c) => !player.curses.includes(c),
+        );
+        if (positives.length > 0 && curses.length > 0) {
+          const pos = positives[Math.floor(Math.random() * positives.length)];
+          const curse = curses[Math.floor(Math.random() * curses.length)];
+          candidates.push({ ...pos, curse, cursed: true });
+        }
+      }
+
       if (candidates.length === 0) break;
       const pick = candidates[Math.floor(Math.random() * candidates.length)];
-      if (pick.shield === undefined) usedKinds.add(pick.kind);
+      // Shield/dash-mod options use a placeholder kind; don't reserve it.
+      if (pick.shield === undefined && pick.dashMod === undefined) usedKinds.add(pick.kind);
       options.push(pick);
     }
 
@@ -502,6 +678,10 @@ export class World {
   }
 
   step(dt: number = SIM_DT): void {
+    // Start gate: don't advance the world until both players have joined.
+    // `started` latches at addHost/addGuest time so a late disconnect doesn't
+    // freeze the survivor.
+    if (!this.started) return;
     if (this.runStatus !== "playing") return;
     this.tick++;
     this.time += dt;
@@ -524,6 +704,7 @@ export class World {
     }
 
     this.processPendingBoxOpens();
+    this.updateCamera(dt);
     this.updatePlayers(dt);
     this.updateSpawns(dt);
     this.updateEnemies(dt);
@@ -558,6 +739,8 @@ export class World {
     this.wave++;
     this.waveTimer = 60;
     this.isBossWave = this.wave % 5 === 0;
+    // New scroll direction each wave (Stage 2).
+    this.setScrollDirection(SCROLL_DIRS[this.wave % SCROLL_DIRS.length]);
     if (this.isBossWave) {
       this.bossTimer = 30;
       this.spawnBoss();
@@ -569,14 +752,75 @@ export class World {
     }
   }
 
-  /** Seed an obstacle layout for the wave. Deterministic-ish variety per wave. */
+  /** Point the camera along a new heading, preserving its current position. */
+  private setScrollDirection(dir: number): void {
+    this.camera.dir = dir;
+    const sp = this.effectiveScrollSpeed();
+    this.camera.vx = Math.cos(dir) * sp;
+    this.camera.vy = Math.sin(dir) * sp;
+  }
+
+  /** Stage 3: a curse active on ANY player modifies the shared world. */
+  private hasCurse(kind: CurseKind): boolean {
+    for (const p of this.players.values()) {
+      if (p.curses.includes(kind)) return true;
+    }
+    return false;
+  }
+
+  private effectiveScrollSpeed(): number {
+    return CAMERA_SCROLL_SPEED * (this.hasCurse("scroll") ? CURSE_MULTS.scroll : 1);
+  }
+
+  /** Move the safe-zone camera; bounce off the world edges by reflecting velocity. */
+  private updateCamera(dt: number): void {
+    const cam = this.camera;
+    cam.x += cam.vx * dt;
+    cam.y += cam.vy * dt;
+    const maxX = WORLD_WIDTH - cam.w;
+    const maxY = WORLD_HEIGHT - cam.h;
+    const sp = this.effectiveScrollSpeed();
+    let bounced = false;
+    if (cam.x <= 0) {
+      cam.x = 0;
+      if (cam.vx < 0) {
+        cam.vx = sp;
+        bounced = true;
+      }
+    } else if (cam.x >= maxX) {
+      cam.x = maxX;
+      if (cam.vx > 0) {
+        cam.vx = -sp;
+        bounced = true;
+      }
+    }
+    if (cam.y <= 0) {
+      cam.y = 0;
+      if (cam.vy < 0) {
+        cam.vy = sp;
+        bounced = true;
+      }
+    } else if (cam.y >= maxY) {
+      cam.y = maxY;
+      if (cam.vy > 0) {
+        cam.vy = -sp;
+        bounced = true;
+      }
+    }
+    if (bounced) cam.dir = Math.atan2(cam.vy, cam.vx);
+  }
+
+  /** Seed an obstacle layout for the wave within a band around the camera. */
   private generateObstacles(wave: number): void {
     const count = OBSTACLE_COUNT_BASE + Math.floor(wave / 3);
     const margin = OBSTACLE_BLOCK_MARGIN;
-    const minX = margin;
-    const maxX = WORLD_WIDTH - margin;
-    const minY = margin;
-    const maxY = WORLD_HEIGHT - margin;
+    const cam = this.camera;
+    // Band: a bit behind the camera through a couple of view-lengths ahead, so
+    // obstacles stream into view as the camera scrolls forward through the wave.
+    const minX = Math.max(margin, cam.x - 200);
+    const maxX = Math.min(WORLD_WIDTH - margin, cam.x + cam.w + 2200);
+    const minY = Math.max(margin, cam.y - 200);
+    const maxY = Math.min(WORLD_HEIGHT - margin, cam.y + cam.h + 200);
     // Seeded RNG so a wave looks the same to both clients within a run, but
     // varies across waves. (Host is authoritative; this just shapes the layout.)
     let seed = wave * 2654435761;
@@ -713,18 +957,27 @@ export class World {
 
   private spawnHealthPack(x?: number, y?: number): void {
     const id = nextPickupId++;
-    const px = x ?? (60 + Math.random() * (WORLD_WIDTH - 120));
-    const py = y ?? (60 + Math.random() * (WORLD_HEIGHT - 120));
-    this.pickups.set(id, { id, x: px, y: py, kind: "health" });
+    // Default: drop within the camera view so a player can always reach it.
+    const cam = this.camera;
+    const px = x ?? cam.x + 80 + Math.random() * (cam.w - 160);
+    const py = y ?? cam.y + 80 + Math.random() * (cam.h - 160);
+    this.pickups.set(id, {
+      id,
+      x: Math.max(0, Math.min(WORLD_WIDTH, px)),
+      y: Math.max(0, Math.min(WORLD_HEIGHT, py)),
+      kind: "health",
+    });
   }
 
   private spawnBoss(): void {
     const id = nextEnemyId++;
     const tier = Math.floor(this.wave / 5); // 1 at wave 5, 2 at wave 10, ...
+    // Boss appears at the camera's forward edge so it marches into view.
+    const anchor = this.cameraAnchor(this.camera.w / 2 + 60, 0);
     this.enemies.set(id, {
       id,
-      x: WORLD_WIDTH / 2,
-      y: WORLD_HEIGHT * 0.25,
+      x: anchor.x,
+      y: anchor.y,
       hp: BOSS_BASE_HP + (tier - 1) * BOSS_HP_PER_TIER,
       kind: 2,
       vx: 0,
@@ -738,7 +991,10 @@ export class World {
     for (const p of this.players.values()) {
       if (p.iFrames > 0) p.iFrames = Math.max(0, p.iFrames - dt);
       if (p.dashCooldown > 0) p.dashCooldown = Math.max(0, p.dashCooldown - dt);
-      if (p.dashTime > 0) p.dashTime = Math.max(0, p.dashTime - dt);
+      if (p.dashTime > 0) {
+        p.dashTime = Math.max(0, p.dashTime - dt);
+        if (p.dashTime === 0) p.lastTrailPos = null; // dash ended, reset trail seeding
+      }
 
       // Mana regen always
       if (p.mana < p.maxMana) {
@@ -767,11 +1023,26 @@ export class World {
         dy /= len;
         p.facingX = dx;
         p.facingY = dy;
-        p.vx = dx * DASH_SPEED;
-        p.vy = dy * DASH_SPEED;
+        // Stage 3: range level boosts burst speed; cooldown level shortens cd.
+        const rangeMult = 1 + p.dashMods.range * DASH_RANGE_BONUS;
+        p.vx = dx * DASH_SPEED * rangeMult;
+        p.vy = dy * DASH_SPEED * rangeMult;
         p.dashTime = DASH_DURATION;
-        p.dashCooldown = DASH_COOLDOWN;
+        p.dashCooldown = effectiveDashCooldown(p.dashMods.cooldown);
         p.iFrames = Math.max(p.iFrames, DASH_I_FRAMES);
+        // Mark the dash start so the trail can be seeded along the path.
+        p.dashStartX = p.x;
+        p.dashStartY = p.y;
+      }
+
+      // Stage 3: trailing damage zone — while dashing with trailLevel > 0, drop
+      // short-lived damage zones along the path every few frames.
+      if (p.dashTime > 0 && p.dashMods.trail > 0) {
+        const last = p.lastTrailPos;
+        if (last === null || Math.hypot(p.x - last.x, p.y - last.y) >= DASH_TRAIL_RADIUS * 0.6) {
+          this.spawnDashTrail(p);
+          p.lastTrailPos = { x: p.x, y: p.y };
+        }
       }
 
       const moving = input.mx !== 0 || input.my !== 0;
@@ -822,6 +1093,27 @@ export class World {
         // Kill velocity into the wall so we don't stick vibrating against it.
         p.vx *= 0.2;
         p.vy *= 0.2;
+      }
+
+      // Void damage (Stage 2): anyone outside the auto-scrolling safe zone takes
+      // damage and is gently pulled back toward it so an AFK player can recover.
+      const cam = this.camera;
+      const offLeft = p.x < cam.x;
+      const offRight = p.x > cam.x + cam.w;
+      const offTop = p.y < cam.y;
+      const offBottom = p.y > cam.y + cam.h;
+      if ((offLeft || offRight || offTop || offBottom) && p.iFrames <= 0) {
+        this.applyDamage(p, VOID_DPS * dt);
+        // Soft push toward the nearest point inside the safe zone.
+        const tx = Math.max(cam.x + r, Math.min(cam.x + cam.w - r, p.x));
+        const ty = Math.max(cam.y + r, Math.min(cam.y + cam.h - r, p.y));
+        let dxe = tx - p.x;
+        let dye = ty - p.y;
+        const de = Math.hypot(dxe, dye) || 1;
+        dxe /= de;
+        dye /= de;
+        p.vx += dxe * VOID_PULL_ACCEL * dt;
+        p.vy += dye * VOID_PULL_ACCEL * dt;
       }
 
       // Swap charge progression (ADR 0001: both must charge to fire)
@@ -884,30 +1176,32 @@ export class World {
             lifetime: 999, // persists until weapon removed or player downed
             orbit: true,
             orbitOffset: (existing.length / want) * Math.PI * 2,
-            weaponKind: w.kind,
-            hostile: false,
-            armTimer: 0,
-            damage: damageFor(w),
-            angle: 0,
-          });
-          existing.push({
-            id,
-            x: p.x,
-            y: p.y,
-            vx: 0,
-            vy: 0,
-            ownerId: p.id,
-            color: def.color,
-            piercing: true,
-            lifetime: 999,
-            orbit: true,
-            orbitOffset: (existing.length / want) * Math.PI * 2,
-            weaponKind: w.kind,
-            hostile: false,
-            armTimer: 0,
-            damage: damageFor(w),
-            angle: 0,
-          });
+          weaponKind: w.kind,
+          hostile: false,
+          shape: def.shape,
+          armTimer: 0,
+          damage: damageFor(w),
+          angle: 0,
+        });
+        existing.push({
+          id,
+          x: p.x,
+          y: p.y,
+          vx: 0,
+          vy: 0,
+          ownerId: p.id,
+          color: def.color,
+          piercing: true,
+          lifetime: 999,
+          orbit: true,
+          orbitOffset: (existing.length / want) * Math.PI * 2,
+          weaponKind: w.kind,
+          hostile: false,
+          shape: def.shape,
+          armTimer: 0,
+          damage: damageFor(w),
+          angle: 0,
+        });
         }
       }
     }
@@ -956,7 +1250,7 @@ export class World {
     }
 
     // Aimed weapons (pulse/spread/lance/frost/homing): target nearest enemy in range
-    const target = this.findNearestEnemy(p.x, p.y, def.range);
+    const target = this.findNearestEnemy(p.x, p.y, def.activationRange);
     if (!target) return;
 
     const baseAngle = Math.atan2(target.y - p.y, target.x - p.x);
@@ -972,7 +1266,7 @@ export class World {
   private fireChain(p: InternalPlayer, w: InternalWeapon, links: number, dmg: number): void {
     const def = WEAPON_DEFS[w.kind];
     let from = { x: p.x, y: p.y };
-    let current = this.findNearestEnemy(from.x, from.y, def.range);
+    let current = this.findNearestEnemy(from.x, from.y, def.activationRange);
     if (!current) return;
     const hit = new Set<number>();
     let damage = dmg;
@@ -1013,6 +1307,7 @@ export class World {
       orbitOffset: 0,
       weaponKind: "chain",
       hostile: false,
+      shape: "spark",
       armTimer: 0,
       damage: 0,
       angle,
@@ -1042,6 +1337,7 @@ export class World {
       orbitOffset: 0,
       weaponKind: w.kind,
       hostile: false,
+      shape: WEAPON_DEFS[w.kind].shape,
       armTimer: MINE_ARM_TIME,
       damage,
       angle: 0,
@@ -1095,6 +1391,7 @@ export class World {
       orbitOffset: 0,
       weaponKind: w.kind,
       hostile: false,
+      shape: WEAPON_DEFS[w.kind].shape,
       armTimer: 0,
       damage,
       angle,
@@ -1149,9 +1446,9 @@ export class World {
     const w = this.wave;
     const weights: Array<[number, number]> = [
       [1, 10], // Walker: always common
-      [3, w >= 3 ? 4 : 0], // Charger: from wave 3
-      [4, w >= 4 ? 3 : 0], // Brute: from wave 4
-      [5, w >= 6 ? 3 : 0], // Caster: from wave 6
+      [3, w >= 4 ? 4 : 0], // Charger: from wave 4
+      [4, w >= 6 ? 3 : 0], // Brute: from wave 6
+      [5, w >= 8 ? 3 : 0], // Caster: from wave 8
     ];
     let total = 0;
     for (const [, weight] of weights) total += weight;
@@ -1174,7 +1471,7 @@ export class World {
       id,
       x: cx,
       y: cy,
-      hp: def.hp + this.wave * 2,
+      hp: def.hp + enemyHpBonus(this.wave),
       kind: def.kind,
       vx: 0,
       vy: 0,
@@ -1183,43 +1480,66 @@ export class World {
     });
   }
 
-  /** Edge anchor + inward direction for a given side (0=top,1=right,2=bottom,3=left). */
-  private edgeAnchor(side: number, inset: number): { x: number; y: number; idx: number; idy: number } {
-    let x = 0;
-    let y = 0;
-    let idx = 0;
-    let idy = 0;
-    if (side === 0) { x = Math.random() * WORLD_WIDTH; y = inset; idy = 1; }
-    else if (side === 1) { x = WORLD_WIDTH - inset; y = Math.random() * WORLD_HEIGHT; idx = -1; }
-    else if (side === 2) { x = Math.random() * WORLD_WIDTH; y = WORLD_HEIGHT - inset; idy = -1; }
-    else { x = inset; y = Math.random() * WORLD_HEIGHT; idx = 1; }
-    // Tangent vector (along the edge)
-    return { x, y, idx, idy };
+  /**
+   * Anchor point relative to the scrolling camera (Stage 2): `offsetForward` is
+   * distance ahead of the camera center along the scroll direction (positive =
+   * into the path the camera is moving), `offsetPerp` is distance along the
+   * perpendicular (left of forward). Returns the anchor plus the perpendicular
+   * tangent (tx,ty) and forward unit (fx,fy) for building formations.
+   */
+  private cameraAnchor(offsetForward: number, offsetPerp: number): {
+    x: number;
+    y: number;
+    tx: number;
+    ty: number;
+    fx: number;
+    fy: number;
+  } {
+    const cam = this.camera;
+    const cx = cam.x + cam.w / 2;
+    const cy = cam.y + cam.h / 2;
+    const fx = Math.cos(cam.dir);
+    const fy = Math.sin(cam.dir);
+    const px = -Math.sin(cam.dir);
+    const py = Math.cos(cam.dir);
+    return {
+      x: cx + fx * offsetForward + px * offsetPerp,
+      y: cy + fy * offsetForward + py * offsetPerp,
+      tx: px,
+      ty: py,
+      fx,
+      fy,
+    };
   }
 
   /**
-   * Spawn a formation (cluster / line / ring / V / double-edge) instead of a
-   * single random edge enemy. Pattern is keyed by wave so each wave feels
-   * distinct; boss waves skip this (boss + adds only).
+   * Spawn a formation (cluster / line / ring / V / flank) just ahead of the
+   * scrolling camera so enemies stream into view from the travel direction.
+   * Boss waves skip this (boss + adds only).
    */
   private spawnFormation(): void {
     const w = this.wave;
-    const patterns: Array<"cluster" | "line" | "ring" | "v" | "doubleEdge"> = [
+    const patterns: Array<"cluster" | "line" | "ring" | "v" | "flank"> = [
       "cluster",
       "line",
       "v",
       "ring",
-      "doubleEdge",
+      "flank",
     ];
     const pattern = patterns[w % patterns.length];
     const def = ENEMY_DEFS[this.pickSpawnKind()] ?? ENEMY_DEFS[1];
-    const inset = 24;
-    const side = Math.floor(Math.random() * 4);
-    const anchor = this.edgeAnchor(side, inset);
-    // Tangent = perpendicular to inward direction.
-    const tx = -anchor.idy;
-    const ty = anchor.idx;
-    const baseN = 4 + Math.floor(w / 4);
+    const cam = this.camera;
+    // Just past the forward edge of the view, with a random flank offset so
+    // enemies don't always appear dead-center.
+    const forward = cam.w / 2 + WORLD_PADDING;
+    const perp = (Math.random() - 0.5) * cam.h * 0.7;
+    const anchor = this.cameraAnchor(forward, perp);
+    const tx = anchor.tx;
+    const ty = anchor.ty;
+    // Inward = back toward the camera/players (opposite of forward).
+    const ix = -anchor.fx;
+    const iy = -anchor.fy;
+    const baseN = 3 + Math.floor(w / 5);
     const n = Math.min(baseN, ENEMY_CAP - this.enemies.size);
     if (n <= 0) return;
 
@@ -1239,30 +1559,33 @@ export class World {
       const radius = 56;
       for (let i = 0; i < n; i++) {
         const ang = (i / n) * Math.PI * 2;
-        this.spawnEnemyAt(def, anchor.x + anchor.idx * 30 + Math.cos(ang) * radius, anchor.y + anchor.idy * 30 + Math.sin(ang) * radius);
+        this.spawnEnemyAt(def, anchor.x + ix * 30 + Math.cos(ang) * radius, anchor.y + iy * 30 + Math.sin(ang) * radius);
       }
     } else if (pattern === "v") {
-      // Two arms forming a V pointing inward from the edge anchor.
+      // Two arms forming a V pointing back toward the camera from the anchor.
       const armLen = Math.ceil(n / 2);
       const spread = 30;
       for (let i = 0; i < armLen; i++) {
         const d = (i + 1) * spread;
-        // Left arm: inward + tangent*0.6
-        this.spawnEnemyAt(def, anchor.x + anchor.idx * d + tx * d * 0.6, anchor.y + anchor.idy * d + ty * d * 0.6);
-        // Right arm: inward - tangent*0.6 (skip duplicate of center if odd)
+        this.spawnEnemyAt(def, anchor.x + ix * d + tx * d * 0.6, anchor.y + iy * d + ty * d * 0.6);
         if (i < armLen - 1 || n % 2 === 0) {
-          this.spawnEnemyAt(def, anchor.x + anchor.idx * d - tx * d * 0.6, anchor.y + anchor.idy * d - ty * d * 0.6);
+          this.spawnEnemyAt(def, anchor.x + ix * d - tx * d * 0.6, anchor.y + iy * d - ty * d * 0.6);
         }
       }
     } else {
-      // doubleEdge: spawn half on `side`, half on the opposite edge.
-      const opp = (side + 2) % 4;
-      const a2 = this.edgeAnchor(opp, inset);
+      // flank: half ahead, half from one perpendicular flank of the camera.
       const half = Math.floor(n / 2);
-      for (let i = 0; i < half; i++) this.spawnEnemyAt(def, anchor.x + tx * (i - half / 2) * 30, anchor.y + ty * (i - half / 2) * 30);
-      const t2x = -a2.idy;
-      const t2y = a2.idx;
-      for (let i = 0; i < n - half; i++) this.spawnEnemyAt(def, a2.x + t2x * (i - (n - half) / 2) * 30, a2.y + t2y * (i - (n - half) / 2) * 30);
+      const flankForward = 40;
+      for (let i = 0; i < half; i++) {
+        const o = (i - half / 2) * 34;
+        this.spawnEnemyAt(def, anchor.x + tx * o, anchor.y + ty * o);
+      }
+      const side = Math.random() < 0.5 ? 1 : -1;
+      const flank = this.cameraAnchor(flankForward, side * (cam.h / 2 + WORLD_PADDING * 0.6));
+      for (let i = 0; i < n - half; i++) {
+        const o = (i - (n - half) / 2) * 34;
+        this.spawnEnemyAt(def, flank.x + flank.tx * o, flank.y + flank.ty * o);
+      }
     }
   }
 
@@ -1272,7 +1595,9 @@ export class World {
     this.enemySpawnCooldown -= dt;
     if (this.enemySpawnCooldown <= 0) {
       // Spawn rate scales with wave; each tick spawns a whole formation.
-      this.enemySpawnCooldown = Math.max(0.5, ENEMY_SPAWN_INTERVAL - this.wave * 0.04);
+      // Stage 3: a spawn curse speeds up the spawn rate (shorter cooldown).
+      const spawnMult = this.hasCurse("spawn") ? CURSE_MULTS.spawn : 1;
+      this.enemySpawnCooldown = Math.max(0.5, (ENEMY_SPAWN_INTERVAL - this.wave * ENEMY_SPAWN_ACCEL) / spawnMult);
       this.spawnFormation();
     }
   }
@@ -1287,7 +1612,9 @@ export class World {
       }
       return;
     }
-    for (const e of this.enemies.values()) {
+    // 1) Compute each enemy's chase/ranged/boss velocity (don't integrate yet).
+    const list = [...this.enemies.values()];
+    for (const e of list) {
       const def = ENEMY_DEFS[e.kind] ?? ENEMY_DEFS[1];
       if (e.slowTimer > 0) e.slowTimer = Math.max(0, e.slowTimer - dt);
 
@@ -1303,13 +1630,18 @@ export class World {
           target = p;
         }
       }
-      if (!target) continue;
+      if (!target) {
+        e.vx = 0;
+        e.vy = 0;
+        continue;
+      }
 
       const dx = target.x - e.x;
       const dy = target.y - e.y;
       const dist = Math.hypot(dx, dy) || 1;
       const slow = e.slowTimer > 0 ? FROST_SLOW_FACTOR : 1;
-      const speed = (def.speed + (e.kind === 2 ? 0 : 0)) * slow;
+      const speedCurse = this.hasCurse("speed") ? CURSE_MULTS.speed : 1;
+      const speed = (def.speed + (e.kind === 2 ? 0 : 0)) * slow * speedCurse;
 
       if (def.ranged) {
         // Caster: keep preferred range; fire on cooldown when in line of sight
@@ -1350,12 +1682,52 @@ export class World {
         e.vx = (dx / dist) * speed;
         e.vy = (dy / dist) * speed;
       }
+    }
 
+    // 2) Separation pass: push overlapping enemies apart so they don't stack.
+    for (let i = 0; i < list.length; i++) {
+      const a = list[i];
+      const ra = (ENEMY_DEFS[a.kind]?.radius ?? ENEMY_RADIUS);
+      for (let j = i + 1; j < list.length; j++) {
+        const b = list[j];
+        const rb = ENEMY_DEFS[b.kind]?.radius ?? ENEMY_RADIUS;
+        const ddx = a.x - b.x;
+        const ddy = a.y - b.y;
+        const minDist = ra + rb;
+        const d2 = ddx * ddx + ddy * ddy;
+        if (d2 >= minDist * minDist || d2 === 0) {
+          if (d2 === 0) {
+            // Exactly overlapping: nudge apart on a random axis to break the tie.
+            const ang = (a.id * 2.399963) % (Math.PI * 2);
+            const push = Math.min(ENEMY_SEPARATION_MAX, minDist * ENEMY_SEPARATION_GAIN);
+            a.vx += Math.cos(ang) * push;
+            a.vy += Math.sin(ang) * push;
+            b.vx -= Math.cos(ang) * push;
+            b.vy -= Math.sin(ang) * push;
+          }
+          continue;
+        }
+        const d = Math.sqrt(d2);
+        const overlap = minDist - d;
+        const nx = ddx / d;
+        const ny = ddy / d;
+        const push = Math.min(ENEMY_SEPARATION_MAX, overlap * ENEMY_SEPARATION_GAIN);
+        a.vx += nx * push;
+        a.vy += ny * push;
+        b.vx -= nx * push;
+        b.vy -= ny * push;
+      }
+    }
+
+    // 3) Integrate + collide with solid obstacles.
+    for (const e of list) {
+      const def = ENEMY_DEFS[e.kind] ?? ENEMY_DEFS[1];
       e.x += e.vx * dt;
       e.y += e.vy * dt;
-
-      // Solid blocks push enemies out too (but enemies can occupy hazard tiles).
+      // Keep enemies inside the world bounds.
       const er = def.radius;
+      e.x = Math.max(er, Math.min(WORLD_WIDTH - er, e.x));
+      e.y = Math.max(er, Math.min(WORLD_HEIGHT - er, e.y));
       const ecol = this.collideObstacle(e.x, e.y, er);
       if (ecol.hit) {
         e.x = ecol.x;
@@ -1393,7 +1765,7 @@ export class World {
         id,
         x: boss.x + Math.cos(ang) * dist,
         y: boss.y + Math.sin(ang) * dist,
-        hp: def.hp + this.wave * 2,
+        hp: def.hp + enemyHpBonus(this.wave),
         kind: def.kind,
         vx: 0,
         vy: 0,
@@ -1425,6 +1797,7 @@ export class World {
       orbitOffset: 0,
       weaponKind: "pulse",
       hostile: true,
+      shape: "circle",
       armTimer: 0,
       damage,
       angle,
@@ -1464,16 +1837,52 @@ export class World {
         this.zones.delete(id);
         continue;
       }
-      // Damage living players standing in the zone (i-frames grant safety)
-      for (const p of this.players.values()) {
-        if (p.downed || p.iFrames > 0) continue;
-        const dx = p.x - z.x;
-        const dy = p.y - z.y;
-        if (dx * dx + dy * dy <= z.radius * z.radius) {
-          this.applyDamage(p, z.dps * dt);
+      if (z.ownerId) {
+        // Stage 3 dash trail: damages enemies and credits the owner.
+        for (const [eid, e] of [...this.enemies]) {
+          const dx = e.x - z.x;
+          const dy = e.y - z.y;
+          if (dx * dx + dy * dy <= z.radius * z.radius) {
+            const applied = Math.min(z.dps * dt, Math.max(0, e.hp));
+            e.hp -= z.dps * dt;
+            if (applied > 0) this.recordDamage(z.ownerId, applied);
+            if (e.hp <= 0) {
+              this.enemies.delete(eid);
+              const dropChance = e.kind === 2 ? BOSS_DROP_CHANCE : BOX_DROP_CHANCE;
+              if (Math.random() < dropChance) this.spawnBox(e.x, e.y);
+              if (Math.random() < HEALTH_PACK_DROP_CHANCE) this.spawnHealthPack(e.x, e.y);
+            }
+          }
+        }
+      } else {
+        // Hostile zone: damage living players standing in it (i-frames grant safety)
+        for (const p of this.players.values()) {
+          if (p.downed || p.iFrames > 0) continue;
+          const dx = p.x - z.x;
+          const dy = p.y - z.y;
+          if (dx * dx + dy * dy <= z.radius * z.radius) {
+            this.applyDamage(p, z.dps * dt);
+          }
         }
       }
     }
+  }
+
+  /** Stage 3: drop a short-lived damaging zone along the dash path. */
+  private spawnDashTrail(p: InternalPlayer): void {
+    const id = nextZoneId++;
+    this.zones.set(id, {
+      id,
+      x: p.x,
+      y: p.y,
+      radius: DASH_TRAIL_RADIUS,
+      telegraph: 0,
+      active: true,
+      duration: DASH_TRAIL_DURATION,
+      dps: DASH_TRAIL_DPS * p.dashMods.trail,
+      color: DASH_TRAIL_COLOR,
+      ownerId: p.id,
+    });
   }
 
   private updateProjectiles(dt: number): void {
@@ -1495,6 +1904,7 @@ export class World {
         const angle = w.orbitPhase + pr.orbitOffset;
         pr.x = owner.x + Math.cos(angle) * ORBIT_RADIUS;
         pr.y = owner.y + Math.sin(angle) * ORBIT_RADIUS;
+        pr.angle = angle + Math.PI / 2; // tangent to the orbit
         continue;
       }
 
@@ -1737,6 +2147,8 @@ export class World {
         cooldown: 0,
         orbitPhase: w.orbitPhase,
       })),
+      dashMods: { ...p.dashMods },
+      curses: [...p.curses],
     }));
     const enemies: EnemyState[] = [...this.enemies.values()].map((e) => ({
       id: e.id,
@@ -1759,6 +2171,8 @@ export class World {
       orbitOffset: pr.orbitOffset,
       weaponKind: pr.weaponKind,
       hostile: pr.hostile,
+      shape: pr.shape,
+      angle: pr.angle,
     }));
     const boxes: BoxState[] = [...this.boxes.values()];
     const zones: ZoneState[] = [...this.zones.values()];
@@ -1796,6 +2210,8 @@ export class World {
       runTime: this.time,
       runDuration: RUN_DURATION,
       runStatus: this.runStatus,
+      started: this.started,
+      camera: { ...this.camera },
     };
   }
 
@@ -1807,12 +2223,16 @@ export class World {
     this.isBossWave = snap.isBossWave;
     this.bossTimer = snap.bossTimer;
     this.runStatus = snap.runStatus;
+    this.started = snap.started ?? this.players.size >= 2;
+    if (snap.camera) this.camera = { ...snap.camera };
 
     this.players.clear();
     for (const ps of snap.players) {
       this.players.set(ps.id, {
         ...ps,
         weapons: ps.weapons.map((w) => ({ ...w })),
+        dashMods: { ...(ps.dashMods ?? { range: 0, trail: 0, cooldown: 0 }) },
+        curses: [...(ps.curses ?? [])],
         bufferedInput: { mx: 0, my: 0, charging: false, dashPressed: false },
         pendingOpenBoxId: null,
         reviveProgress: ps.reviveProgress,
@@ -1821,6 +2241,9 @@ export class World {
         damageLog: [],
         damageAccum: 0,
         damageWindowStart: 0,
+        dashStartX: 0,
+        dashStartY: 0,
+        lastTrailPos: null,
       });
     }
     this.enemies.clear();
@@ -1834,7 +2257,7 @@ export class World {
         ...pr,
         armTimer: 0,
         damage: 0,
-        angle: Math.atan2(pr.vy, pr.vx),
+        angle: pr.angle ?? Math.atan2(pr.vy, pr.vx),
       });
     }
     this.boxes.clear();
@@ -1888,6 +2311,8 @@ export class World {
         cooldown: 0,
         orbitPhase: w.orbitPhase,
       })),
+      dashMods: { ...p.dashMods },
+      curses: [...p.curses],
     }));
   }
 

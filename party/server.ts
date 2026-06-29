@@ -28,7 +28,8 @@ export default class GameServer implements Party.Server {
   constructor(readonly room: Party.Room) {}
 
   onStart(): void {
-    this.ensureRunning();
+    // Don't start the tick loop yet: the sim must wait for both players to join
+    // (start gate). The timer is started in onConnect once player 2 connects.
   }
 
   onConnect(connection: Party.Connection): void {
@@ -42,7 +43,8 @@ export default class GameServer implements Party.Server {
     if (this.players.length === 0) this.world.addHostPlayer(id);
     else this.world.addGuestPlayer(id);
     this.players.push(id);
-    this.ensureRunning();
+    // Start gate: only begin stepping/broadcasting once both players are here.
+    if (this.players.length === MAX_PLAYERS) this.ensureRunning();
   }
 
   onMessage(message: string | ArrayBuffer, sender: Party.Connection): void {

@@ -74,6 +74,7 @@
       rgba(0, 0, 0, 0.18) 3px,
       rgba(0, 0, 0, 0) 4px
     );
+  transition: filter 120ms ease-out;
 }
 
 .crt-overlay::after {
@@ -83,4 +84,39 @@
   pointer-events: none;
   background:
     linear-gradient(90deg, rgba(255, 0, 0, 0.03) 0%, rgba(0, 0, 0, 0) 6%, rgba(0, 0, 0, 0) 94%, rgba(0, 80, 255, 0.04) 100%);
+  transition: opacity 120ms ease-out;
+}
+
+/* Hit pulse: amps the distortion momentarily when the local player takes damage.
+   Deeper vignette, thicker scanlines bleed, and a red chromatic split via ::before. */
+.crt-overlay.crt-hit {
+  filter: contrast(1.08) saturate(1.1);
+  animation: crt-warp 220ms ease-out;
+}
+
+.crt-overlay.crt-hit::after {
+  opacity: 1.6;
+}
+
+.crt-overlay::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  background:
+    radial-gradient(ellipse at center, rgba(0, 0, 0, 0) 45%, rgba(0, 0, 0, 0.7) 100%),
+    linear-gradient(90deg, rgba(255, 0, 0, 0.18) 0%, rgba(0, 0, 0, 0) 8%, rgba(0, 0, 0, 0) 92%, rgba(0, 120, 255, 0.22) 100%);
+  transition: opacity 120ms ease-out;
+}
+
+.crt-overlay.crt-hit::before {
+  opacity: 1;
+}
+
+@keyframes crt-warp {
+  0%   { transform: scale(1) skewX(0deg); }
+  20%  { transform: scale(1.012) skewX(0.4deg); }
+  45%  { transform: scale(1.006) skewX(-0.3deg); }
+  100% { transform: scale(1) skewX(0deg); }
 }

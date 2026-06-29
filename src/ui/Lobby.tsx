@@ -151,9 +151,27 @@ export function Lobby({ onHost, onJoin }: LobbyProps) {
               <p className="font-mono text-[11px] uppercase tracking-[0.18em] text-[var(--color-success)]">
                 Connected
               </p>
-              <p className="mt-4 text-xs text-[var(--color-text-muted)]">
-                Spawning into the world
-              </p>
+
+              {roomCode && (
+                <div className="mt-4">
+                  <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--color-text-faint)]">
+                    Your room code
+                  </p>
+                  <p className="mt-1 text-center font-mono text-2xl tracking-[0.4em] text-[var(--color-text)]">
+                    {roomCode}
+                  </p>
+                  <p className="mt-2 text-center text-[10px] text-[var(--color-text-faint)]">
+                    Share this code with your friend
+                  </p>
+                </div>
+              )}
+
+              <div className="mt-4 flex items-center gap-2">
+                <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--color-accent)]" />
+                <p className="text-xs text-[var(--color-text-muted)]">
+                  Waiting for Player 2 to join…
+                </p>
+              </div>
             </motion.div>
           )}
         </AnimatePresence>

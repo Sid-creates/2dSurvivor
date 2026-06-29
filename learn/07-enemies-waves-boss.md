@@ -21,29 +21,35 @@ projectiles (`ENEMY_PROJ_SPEED`, `ENEMY_PROJ_DAMAGE`) every
 
 ## How enemies spawn — formations
 
-Instead of a random trickle from one edge, each wave picks a **formation
-pattern** and spawns a group at once. This makes waves feel distinct. Patterns
-(see `spawnFormation` in `World.ts`):
+Instead of a random trickle, each wave picks a **formation pattern** and spawns a
+group at once, **just ahead of the scrolling camera** so the swarm streams into
+view from the travel direction. This makes waves feel distinct and ties into the
+moving safe zone. Patterns (see `spawnFormation` in `World.ts`):
 
-- **cluster** — a tight blob at one edge.
-- **line** — a row across an edge.
-- **ring** — surrounding the players in a circle (dangerous).
-- **V** — a wedge charging in from a corner.
-- **double-edge** — two groups from opposite sides (pincer).
+- **cluster** — a tight blob ahead of the camera.
+- **line** — a row across the camera's forward edge.
+- **ring** — a ring charging in.
+- **V** — a wedge pointing back toward the players.
+- **flank** — half ahead, half from one perpendicular flank (pincer).
 
 The formation picker is keyed by wave number, so higher waves use meaner
 patterns. Spawns are still throttled by `ENEMY_SPAWN_INTERVAL` and a soft
-`ENEMY_CAP = 90` so the screen never melts.
+`ENEMY_CAP = 90` so the screen never melts. Enemies also run a **separation
+pass** every tick so they spread out instead of collapsing into one blob.
 
 ## Waves & escalation
 
 - Each wave has a timer (`waveTimer`). Clear the timer → `advanceWave()`:
   - `wave += 1`,
-  - clear the old obstacle field and generate a **new** one
-    (`generateObstacles(wave)`),
+  - pick a **new camera scroll direction** (8 directions, cycled per wave),
+  - clear the old obstacle field and generate a **new** one within a band around
+    the camera (`generateObstacles(wave)`),
   - every 5th wave (`wave % 5 === 0`) → **boss wave**.
-- As waves rise, tougher enemy types enter the spawn pool (wave 1 is walkers
-  only; brutes/chargers/casters unlock later — see the `enemyKindForWave` logic).
+- **Early-game curve**: waves 1–5 are gentler — slower spawns, smaller
+  formations (`3 + floor(wave/5)`), a slower HP ramp, and later enemy-kind
+  unlocks (Charger from wave 4, Brute from wave 6, Caster from wave 8). After
+  wave 5 the ramp steepens.
+- A **Swarm curse** (Stage 3) multiplies the spawn rate for the rest of the run.
 
 ## Boss waves
 

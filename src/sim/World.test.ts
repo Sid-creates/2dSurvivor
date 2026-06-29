@@ -15,6 +15,13 @@ import {
   SWAP_CHARGE_DURATION,
   BOX_OPEN_RANGE,
   WORLD_WIDTH,
+  WORLD_HEIGHT,
+  VIEW_WIDTH,
+  VIEW_HEIGHT,
+  CAMERA_SCROLL_SPEED,
+  VOID_DPS,
+  DASH_SPEED,
+  DASH_COOLDOWN,
   PLAYER_MAX_MANA,
   PLAYER_COLORS,
   PLAYER_MAX_SPEED,
@@ -56,6 +63,16 @@ function makeSnapshot(overrides: Partial<Snapshot> = {}): Snapshot {
     runTime: 0,
     runDuration: RUN_DURATION,
     runStatus: "playing",
+    started: true,
+    camera: {
+      x: (WORLD_WIDTH - VIEW_WIDTH) / 2,
+      y: (WORLD_HEIGHT - VIEW_HEIGHT) / 2,
+      w: VIEW_WIDTH,
+      h: VIEW_HEIGHT,
+      vx: CAMERA_SCROLL_SPEED,
+      vy: 0,
+      dir: 0,
+    },
     ...overrides,
   };
 }
@@ -122,6 +139,37 @@ describe("player spawning", () => {
     for (let i = 0; i < 10; i++) w.step(SIM_DT);
     const after = w.snapshot().players.find((p) => p.id === GUEST_ID)!.x;
     expect(after).toBeGreaterThan(before);
+  });
+});
+
+describe("start gate", () => {
+  it("does not step until both players have joined", () => {
+    const w = makeWorld();
+    w.addHostPlayer(HOST_ID);
+    expect(w.snapshot().started).toBe(false);
+    const before = w.snapshot().t;
+    for (let i = 0; i < 30; i++) w.step(SIM_DT);
+    // No time advanced, no enemies spawned while waiting for P2.
+    expect(w.snapshot().t).toBe(before);
+    expect(w.snapshot().enemies.length).toBe(0);
+    expect(w.snapshot().started).toBe(false);
+
+    w.addGuestPlayer(GUEST_ID);
+    expect(w.snapshot().started).toBe(true);
+    const t0 = w.snapshot().t;
+    w.step(SIM_DT);
+    expect(w.snapshot().t).toBeGreaterThan(t0);
+  });
+
+  it("keeps running (latched) if a player disconnects after start", () => {
+    const w = twoPlayerWorld();
+    expect(w.snapshot().started).toBe(true);
+    w.removePlayer(GUEST_ID);
+    // started latches: the survivor keeps playing.
+    expect(w.snapshot().started).toBe(true);
+    const t0 = w.snapshot().t;
+    w.step(SIM_DT);
+    expect(w.snapshot().t).toBeGreaterThan(t0);
   });
 });
 
@@ -353,6 +401,83 @@ describe("positional swap", () => {
     expect(hostAfter.chargeProgress).toBe(0);
     expect(guestAfter.chargeProgress).toBe(0);
     expect(hostAfter.charging).toBe(false);
+  });
+});
+
+describe("enemy separation", () => {
+  it("pushes overlapping enemies apart so they don't stack on one point", () => {
+    const w = twoPlayerWorld();
+    const cx = WORLD_WIDTH * 0.5;
+    const cy = WORLD_HEIGHT * 0.12;
+    applyFromWorld(w, {
+      enemies: [
+        { id: 9001, x: cx, y: cy, hp: 200, kind: 1 },
+        { id: 9002, x: cx, y: cy, hp: 200, kind: 1 },
+      ],
+    });
+    // Both chase the same nearest player from the same spot, so chase contributes
+    // ~0 relative motion; only separation spreads them.
+    for (let i = 0; i < 30; i++) w.step(SIM_DT);
+    const es = w.snapshot().enemies.filter((e) => e.id === 9001 || e.id === 9002);
+    const a = es.find((e) => e.id === 9001)!;
+    const b = es.find((e) => e.id === 9002)!;
+    const dist = Math.hypot(a.x - b.x, a.y - b.y);
+    // Two walkers: radius 12 + 12 = 24 expected separation.
+    expect(dist).toBeGreaterThanOrEqual(22);
+  });
+});
+
+describe("scrolling world (Stage 2)", () => {
+  it("auto-scrolls the safe-zone camera each step", () => {
+    const w = twoPlayerWorld();
+    const cam0 = w.snapshot().camera;
+    expect(cam0.w).toBe(VIEW_WIDTH);
+    expect(cam0.h).toBe(VIEW_HEIGHT);
+    const startX = cam0.x;
+    for (let i = 0; i < 10; i++) w.step(SIM_DT);
+    const cam1 = w.snapshot().camera;
+    // dir starts at 0 (scrolling right), so x must increase.
+    expect(cam1.x).toBeGreaterThan(startX);
+  });
+
+  it("picks a new scroll direction each wave", () => {
+    const w = twoPlayerWorld();
+    const dir1 = w.snapshot().camera.dir;
+    // Force a wave advance by draining the wave timer.
+    applyFromWorld(w, { waveTimer: 0 });
+    w.step(SIM_DT);
+    const dir2 = w.snapshot().camera.dir;
+    expect(w.snapshot().wave).toBe(2);
+    expect(dir2).not.toBe(dir1);
+  });
+
+  it("damages players standing outside the safe zone (void)", () => {
+    const w = twoPlayerWorld();
+    const cam = w.snapshot().camera;
+    // Park the host just beyond the right edge of the safe zone.
+    applyFromWorld(w, {
+      players: w.snapshot().players.map((p) =>
+        p.id === HOST_ID ? { ...p, x: cam.x + cam.w + 40, y: cam.y + cam.h / 2, vx: 0, vy: 0 } : p,
+      ),
+    });
+    const before = w.snapshot().players.find((p) => p.id === HOST_ID)!.hp;
+    w.step(SIM_DT);
+    const after = w.snapshot().players.find((p) => p.id === HOST_ID)!.hp;
+    expect(after).toBeLessThan(before);
+    // Roughly VOID_DPS * dt of damage (allow the soft-pull to not fully negate it).
+    expect(before - after).toBeGreaterThanOrEqual(VOID_DPS * SIM_DT * 0.5);
+  });
+
+  it("spawns enemies ahead of the camera so they stream into view", () => {
+    const w = twoPlayerWorld();
+    // Step past the first spawn cooldown (~1.6s) so a formation appears.
+    for (let i = 0; i < 120; i++) w.step(SIM_DT);
+    const snap = w.snapshot();
+    expect(snap.enemies.length).toBeGreaterThan(0);
+    const cam = snap.camera;
+    const forwardEdge = cam.x + cam.w / 2;
+    // At least one enemy should have spawned ahead of the camera center.
+    expect(snap.enemies.some((e) => e.x > forwardEdge)).toBe(true);
   });
 });
 
@@ -770,5 +895,105 @@ describe("DPS meter", () => {
     for (let i = 0; i < 30; i++) w.step(SIM_DT);
     const host = w.snapshot().players.find((p) => p.id === HOST_ID)!;
     expect(host.dps).toBeGreaterThan(0);
+  });
+});
+
+describe("dash upgrades and curses (Stage 3)", () => {
+  it("range level boosts dash burst speed", () => {
+    const w = twoPlayerWorld();
+    applyFromWorld(w, {
+      players: w.snapshot().players.map((p) =>
+        p.id === HOST_ID ? { ...p, dashMods: { range: 2, trail: 0, cooldown: 0 } } : p,
+      ),
+    });
+    w.setPlayerInput(HOST_ID, { mx: 1, my: 0, charging: false, dashPressed: true });
+    w.step(SIM_DT);
+    const host = w.snapshot().players.find((p) => p.id === HOST_ID)!;
+    // 2 range levels => +60% burst speed over the base DASH_SPEED.
+    expect(host.vx).toBeGreaterThan(DASH_SPEED);
+  });
+
+  it("cooldown level shortens the dash cooldown", () => {
+    const w = twoPlayerWorld();
+    applyFromWorld(w, {
+      players: w.snapshot().players.map((p) =>
+        p.id === HOST_ID ? { ...p, dashMods: { range: 0, trail: 0, cooldown: 2 } } : p,
+      ),
+    });
+    w.setPlayerInput(HOST_ID, { mx: 1, my: 0, charging: false, dashPressed: true });
+    w.step(SIM_DT);
+    const host = w.snapshot().players.find((p) => p.id === HOST_ID)!;
+    expect(host.dashCooldown).toBeLessThan(DASH_COOLDOWN);
+  });
+
+  it("trail level leaves a damaging zone along the dash path", () => {
+    const w = twoPlayerWorld();
+    applyFromWorld(w, {
+      players: w.snapshot().players.map((p) =>
+        p.id === HOST_ID ? { ...p, dashMods: { range: 0, trail: 1, cooldown: 0 } } : p,
+      ),
+    });
+    w.setPlayerInput(HOST_ID, { mx: 1, my: 0, charging: false, dashPressed: true });
+    for (let i = 0; i < 5; i++) w.step(SIM_DT);
+    expect(w.snapshot().zones.some((z) => z.ownerId === HOST_ID)).toBe(true);
+  });
+
+  it("spawn curse makes enemies appear sooner", () => {
+    const clean = twoPlayerWorld();
+    const cursed = twoPlayerWorld();
+    applyFromWorld(cursed, {
+      players: cursed.snapshot().players.map((p) =>
+        p.id === HOST_ID ? { ...p, curses: ["spawn"] } : p,
+      ),
+    });
+    // 180 steps ~= 3.0s. The first spawn (1.6s) is shared; the curse shortens
+    // the *next* cooldown so the cursed world gets a second formation before the
+    // clean world does. Enemies spawn far ahead of the camera and haven't reached
+    // the players yet, so weapon fire doesn't muddy the counts.
+    for (let i = 0; i < 180; i++) {
+      clean.step(SIM_DT);
+      cursed.step(SIM_DT);
+    }
+    const cleanCount = clean.snapshot().enemies.length;
+    const cursedCount = cursed.snapshot().enemies.length;
+    expect(cleanCount).toBeGreaterThan(0);
+    expect(cursedCount).toBeGreaterThan(cleanCount);
+  });
+
+  it("speed curse makes enemies chase faster", () => {
+    const clean = twoPlayerWorld();
+    const cursed = twoPlayerWorld();
+    const base = clean.snapshot().players.find((p) => p.id === HOST_ID)!;
+    const enemy = { id: 9101, x: base.x + 120, y: base.y, hp: 200, kind: 1 };
+    applyFromWorld(clean, { enemies: [enemy] });
+    applyFromWorld(cursed, {
+      enemies: [enemy],
+      players: cursed.snapshot().players.map((p) =>
+        p.id === HOST_ID ? { ...p, curses: ["speed"] } : p,
+      ),
+    });
+    clean.step(SIM_DT);
+    cursed.step(SIM_DT);
+    const cE = clean.snapshot().enemies.find((e) => e.id === 9101)!;
+    const xE = cursed.snapshot().enemies.find((e) => e.id === 9101)!;
+    // Both moved left toward the host; the cursed one covered more ground.
+    expect((base.x + 120) - xE.x).toBeGreaterThan((base.x + 120) - cE.x);
+  });
+
+  it("hp curse (cursed option) cuts max HP and records the curse", () => {
+    const w = twoPlayerWorld();
+    const before = w.snapshot().players.find((p) => p.id === HOST_ID)!;
+    const beforeMax = before.maxHp;
+    w.applyPickOption(HOST_ID, {
+      kind: "pulse",
+      upgradeIndex: 0,
+      resultingLevel: before.weapons[0].level + 1,
+      curse: "hp",
+      cursed: true,
+      bonusLevels: 0,
+    });
+    const after = w.snapshot().players.find((p) => p.id === HOST_ID)!;
+    expect(after.curses).toContain("hp");
+    expect(after.maxHp).toBeLessThan(beforeMax);
   });
 });

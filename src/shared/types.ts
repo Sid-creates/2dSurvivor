@@ -55,7 +55,14 @@ export interface PlayerState {
   color: number;
   /** Active weapons this player owns. See CONTEXT.md: Weapon. */
   weapons: WeaponInstance[];
+  /** Dash upgrade levels (Stage 3): range / trail / cooldown. */
+  dashMods: { range: number; trail: number; cooldown: number };
+  /** Active curses on this player (Stage 3): run-long negative modifiers. */
+  curses: CurseKind[];
 }
+
+/** Identifiers for the cursed upgrade trade-offs (Stage 3). */
+export type CurseKind = "spawn" | "speed" | "hp" | "scroll";
 
 export interface EnemyState {
   id: number;
@@ -85,6 +92,10 @@ export interface ProjectileState {
   weaponKind: import("../sim/weapons").WeaponKind;
   /** True if fired by an enemy and damages players instead of enemies. */
   hostile: boolean;
+  /** Visual shape of the projectile (Stage 1). */
+  shape: import("../sim/weapons").ProjectileShape;
+  /** Heading angle in radians, used to orient non-circular shapes. */
+  angle: number;
 }
 
 /** A telegraphed ground hazard that damages players standing in it. */
@@ -102,6 +113,8 @@ export interface ZoneState {
   /** Damage per second while active. */
   dps: number;
   color: number;
+  /** If set, this zone damages ENEMIES and credits this player (Stage 3 dash trail). */
+  ownerId?: string;
 }
 
 /** A static obstacle placed on the field each wave. Phase B: obstacle field. */
@@ -148,11 +161,30 @@ export interface WeaponPickOption {
   resultingLevel: number;
   /** If set, this option grants shield instead of a weapon. Phase B: defensive item. */
   shield?: number;
+  /** If set, this option grants a dash upgrade level (Stage 3). */
+  dashMod?: "range" | "trail" | "cooldown";
+  /** If set, this option applies a curse (Stage 3). Paired with a strong positive. */
+  curse?: CurseKind;
+  /** UI flag: render this option with a warning style (Stage 3). */
+  cursed?: boolean;
+  /** For cursed options, bonus levels added on top of the weapon upgrade. */
+  bonusLevels?: number;
 }
 
 export type RunStatus = "playing" | "won" | "lost";
 
 /** Full authoritative world snapshot, broadcast Host→Guest at 30Hz. */
+export interface CameraState {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  vx: number;
+  vy: number;
+  /** Heading angle (radians) the camera is currently scrolling toward. */
+  dir: number;
+}
+
 export interface Snapshot {
   t: number;
   tick: number;
@@ -170,6 +202,10 @@ export interface Snapshot {
   runTime: number;
   runDuration: number;
   runStatus: RunStatus;
+  /** False until both players have joined; the sim doesn't step until then. */
+  started: boolean;
+  /** Server-owned auto-scrolling safe-zone camera (Stage 2). */
+  camera: CameraState;
 }
 
 /** Per-frame input from a single Player. Sent Guest→Host each local frame. */

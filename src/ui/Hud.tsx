@@ -1,12 +1,21 @@
 import { useEffect, useState } from "react";
 import { bridge } from "../bridge/GameBridge";
-import type { Snapshot } from "../shared/types";
 import {
   BOX_OPEN_RANGE,
   BOSS_BASE_HP,
   BOSS_HP_PER_TIER,
   DASH_COOLDOWN,
+  DASH_CD_REDUCTION,
+  DASH_CD_MIN,
 } from "../shared/config";
+import type { CurseKind, Snapshot } from "../shared/types";
+
+const CURSE_TAGS: Record<CurseKind, string> = {
+  spawn: "Swarm",
+  speed: "Haste",
+  hp: "Frailty",
+  scroll: "Drift",
+};
 
 // In-game HUD overlay. Reads snapshots from the bridge and renders HP, mana,
 // wave timer, boss timer, swap charge meters. Positioned absolutely over the
@@ -168,6 +177,8 @@ interface PlayerStat {
   dps: number;
   downed: boolean;
   color: number;
+  dashMods: { range: number; trail: number; cooldown: number };
+  curses: CurseKind[];
 }
 
 function PlayerStatBlock({
@@ -182,9 +193,14 @@ function PlayerStatBlock({
   const hpFrac = Math.max(0, player.hp / player.maxHp);
   const manaFrac = Math.max(0, player.mana / player.maxMana);
   const shieldFrac = player.maxShield > 0 ? Math.max(0, player.shieldHp / player.maxShield) : 0;
-  const dashFrac = Math.max(0, 1 - player.dashCooldown / DASH_COOLDOWN);
+  // Stage 3: cooldown levels shorten the dash cooldown, so scale the meter to
+  // the player's effective max rather than the base.
+  const dashMax = DASH_COOLDOWN * Math.max(DASH_CD_MIN, 1 - player.dashMods.cooldown * DASH_CD_REDUCTION);
+  const dashFrac = Math.max(0, 1 - player.dashCooldown / dashMax);
   const dashReady = player.dashCooldown <= 0;
   const colorHex = `#${player.color.toString(16).padStart(6, "0")}`;
+  const hasDashMods =
+    player.dashMods.range + player.dashMods.trail + player.dashMods.cooldown > 0;
 
   return (
     <div
@@ -277,6 +293,39 @@ function PlayerStatBlock({
           {dashReady ? "Dash" : `${player.dashCooldown.toFixed(1)}s`}
         </span>
       </div>
+
+      {/* Stage 3: dash upgrade levels + active curses */}
+      {hasDashMods && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+          {player.dashMods.range > 0 && (
+            <span className="rounded border border-[#fbbf24]/50 px-1.5 py-0.5 font-mono text-[10px] text-[#fbbf24]">
+              Reach {player.dashMods.range}
+            </span>
+          )}
+          {player.dashMods.trail > 0 && (
+            <span className="rounded border border-[#fbbf24]/50 px-1.5 py-0.5 font-mono text-[10px] text-[#fbbf24]">
+              Trail {player.dashMods.trail}
+            </span>
+          )}
+          {player.dashMods.cooldown > 0 && (
+            <span className="rounded border border-[#fbbf24]/50 px-1.5 py-0.5 font-mono text-[10px] text-[#fbbf24]">
+              Cooldown {player.dashMods.cooldown}
+            </span>
+          )}
+        </div>
+      )}
+      {player.curses.length > 0 && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+          {player.curses.map((c) => (
+            <span
+              key={c}
+              className="rounded border border-[var(--color-danger)]/60 px-1.5 py-0.5 font-mono text-[10px] text-[var(--color-danger)]"
+            >
+              {CURSE_TAGS[c]} Curse
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

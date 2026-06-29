@@ -1,12 +1,41 @@
 import { motion } from "motion/react";
 import { WEAPON_DEFS } from "../sim/weapons";
-import type { WeaponPickOption } from "../shared/types";
+import type { CurseKind, WeaponPickOption } from "../shared/types";
 
 interface BoxMenuProps {
   options: WeaponPickOption[];
   onChoose: (optionIndex: number) => void;
   onCancel: () => void;
 }
+
+const DASH_ACCENT = 0xfbbf24;
+const CURSE_ACCENT = 0xef4444;
+
+const DASH_NAMES: Record<NonNullable<WeaponPickOption["dashMod"]>, string> = {
+  range: "Dash: Reach",
+  trail: "Dash: Trail",
+  cooldown: "Dash: Cooldown",
+};
+
+const DASH_DESC: Record<NonNullable<WeaponPickOption["dashMod"]>, string> = {
+  range: "Longer dash burst. Cover more ground in a blink.",
+  trail: "Leave a damaging trail along your dash path.",
+  cooldown: "Dash comes back sooner. More bursts, more i-frames.",
+};
+
+const CURSE_NAMES: Record<CurseKind, string> = {
+  spawn: "Swarm Curse",
+  speed: "Haste Curse",
+  hp: "Frailty Curse",
+  scroll: "Drift Curse",
+};
+
+const CURSE_DESC: Record<CurseKind, string> = {
+  spawn: "More enemies spawn for the rest of the run.",
+  speed: "Enemies chase faster for the rest of the run.",
+  hp: "Your max HP is cut for the rest of the run.",
+  scroll: "The safe zone scrolls faster for the rest of the run.",
+};
 
 // Pick-3 weapon menu. Per design-taste skill: dark surface, single accent,
 // no em-dashes, no serif, no fake screenshots. The three options are the
@@ -58,42 +87,97 @@ function OptionCard({
   const def = WEAPON_DEFS[option.kind];
   const isHeal = option.resultingLevel === 0;
   const isShield = option.shield !== undefined;
-  const isUpgrade = !isHeal && !isShield && option.upgradeIndex >= 0;
-  const accentColor = isShield ? 0x7dd3fc : def.color;
+  const isDash = option.dashMod !== undefined;
+  const isCursed = option.cursed === true;
+  const isUpgrade = !isHeal && !isShield && !isDash && option.upgradeIndex >= 0;
+
+  const accentColor = isCursed
+    ? CURSE_ACCENT
+    : isDash
+      ? DASH_ACCENT
+      : isShield
+        ? 0x7dd3fc
+        : def.color;
+  const accentHex = `#${accentColor.toString(16).padStart(6, "0")}`;
+
+  const tag = isCursed
+    ? "cursed"
+    : isDash
+      ? "dash"
+      : isHeal
+        ? "heal"
+        : isShield
+          ? "shield"
+          : isUpgrade
+            ? `lv ${option.resultingLevel}`
+            : "new";
+
+  const title = isCursed
+    ? def.name
+    : isDash
+      ? DASH_NAMES[option.dashMod!]
+      : isHeal
+        ? "Mend"
+        : isShield
+          ? "Aegis"
+          : def.name;
+
+  const description = isCursed
+    ? `Strong upgrade, but: ${option.curse ? CURSE_DESC[option.curse] : ""}`
+    : isDash
+      ? DASH_DESC[option.dashMod!]
+      : isHeal
+        ? "Restore some HP and close the box."
+        : isShield
+          ? `Add +${option.shield} absorb shield. Damage hits this before HP.`
+          : def.description;
 
   return (
     <button
       onClick={onClick}
-      className="group flex flex-col items-start gap-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-elevated)] p-4 text-left transition-all duration-150 hover:-translate-y-0.5 hover:border-[var(--color-accent)] hover:bg-[var(--color-surface)] active:translate-y-0"
+      className={`group flex flex-col items-start gap-3 rounded-lg border p-4 text-left transition-all duration-150 hover:-translate-y-0.5 active:translate-y-0 ${
+        isCursed
+          ? "border-[var(--color-danger)] bg-[var(--color-surface-elevated)] hover:bg-[var(--color-surface)]"
+          : isDash
+            ? "border-[var(--color-border)] bg-[var(--color-surface-elevated)] hover:border-[var(--color-accent)] hover:bg-[var(--color-surface)]"
+            : "border-[var(--color-border)] bg-[var(--color-surface-elevated)] hover:border-[var(--color-accent)] hover:bg-[var(--color-surface)]"
+      }`}
     >
       <div className="flex w-full items-center justify-between">
+        <span className="inline-block h-3 w-3 rounded-full" style={{ backgroundColor: accentHex }} />
         <span
-          className="inline-block h-3 w-3 rounded-full"
-          style={{ backgroundColor: `#${accentColor.toString(16).padStart(6, "0")}` }}
-        />
-        <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--color-text-faint)]">
-          {isHeal ? "heal" : isShield ? "shield" : isUpgrade ? `lv ${option.resultingLevel}` : "new"}
+          className={`font-mono text-[10px] uppercase tracking-[0.18em] ${
+            isCursed ? "text-[var(--color-danger)]" : "text-[var(--color-text-faint)]"
+          }`}
+        >
+          {tag}
         </span>
       </div>
       <div>
-        <p className="text-sm font-medium text-[var(--color-text)]">
-          {isHeal ? "Mend" : isShield ? "Aegis" : def.name}
-        </p>
-        <p className="mt-1 text-xs text-[var(--color-text-muted)]">
-          {isHeal
-            ? "Restore some HP and close the box."
-            : isShield
-              ? `Add +${option.shield} absorb shield. Damage hits this before HP.`
-              : def.description}
-        </p>
+        <p className="text-sm font-medium text-[var(--color-text)]">{title}</p>
+        <p className="mt-1 text-xs text-[var(--color-text-muted)]">{description}</p>
       </div>
-      {!isHeal && !isShield && (
+      {isCursed && option.curse && (
+        <div className="pt-1">
+          <span className="rounded border border-[var(--color-danger)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--color-danger)]">
+            {CURSE_NAMES[option.curse]}
+          </span>
+        </div>
+      )}
+      {!isHeal && !isShield && !isDash && !isCursed && (
         <div className="flex flex-wrap gap-1.5 pt-1">
           <Stat label="dmg" value={def.baseDamage.toString()} />
           <Stat label="rate" value={`${(1 / def.baseInterval).toFixed(1)}/s`} />
           <Stat label="range" value={def.range.toString()} />
           {def.piercing && <Stat label="pierce" value="yes" />}
           {def.orbit && <Stat label="orbit" value="yes" />}
+        </div>
+      )}
+      {isCursed && (
+        <div className="flex flex-wrap gap-1.5 pt-1">
+          <Stat label="dmg" value={def.baseDamage.toString()} />
+          <Stat label="lv" value={option.resultingLevel.toString()} />
+          <Stat label="range" value={def.range.toString()} />
         </div>
       )}
     </button>

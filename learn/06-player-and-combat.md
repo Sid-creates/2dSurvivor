@@ -9,23 +9,42 @@ in `src/shared/config.ts`; the behavior lives in `src/sim/World.ts`.
 - Acceleration model: you accelerate toward the input direction up to
   `PLAYER_MAX_SPEED = 220 px/s`, and decelerate when you let go. Feels weighty,
   not instant.
-- The world is `1280 × 720` (`WORLD_WIDTH/HEIGHT`); players are clamped inside
-  with a `PLAYER_RADIUS = 14` margin.
+- The world is large (`WORLD_WIDTH/HEIGHT = 3200²`); the action is confined to
+  the **scrolling safe zone** (a 1280×720 camera). Players are clamped inside the
+  world with a `PLAYER_RADIUS = 14` margin, and anyone outside the safe zone
+  takes **void damage** (see "The void" below).
 - Solid **block obstacles** push you out (you can't walk through them).
+
+## The void
+
+The safe zone auto-scrolls across the world. If you fall behind or stray outside
+it, you take `VOID_DPS = 18` damage per second and get a gentle pull back toward
+the zone. Stay in the light. The HUD border turns red when you're outside.
 
 ## Dash (Shift)
 
 A short burst used for dodging and repositioning.
 
 - On press (edge-triggered in `InputManager`), if `dashCooldown ≤ 0`:
-  - Velocity is set to `DASH_SPEED = 640 px/s` in your input direction (or your
-    last facing direction if you're standing still).
+  - Velocity is set to `DASH_SPEED = 640 px/s` (× your **range** upgrade) in your
+    input direction (or your last facing direction if you're standing still).
   - `dashTime = 0.15s` — the burst is maintained (ignores accel/decel).
-  - `dashCooldown = 3.0s` — the HUD shows this as a meter refilling.
+  - `dashCooldown = 3.0s` (÷ your **cooldown** upgrade) — the HUD meter refills.
   - `iFrames = max(iFrames, 0.18s)` — brief invulnerability ("i-frames").
 - No dash while downed or on cooldown.
 
 The i-frames are the real prize: dash *through* a boss charge or a hazard burst.
+
+### Dash upgrades (from Boxes)
+
+Three stackable mods, each capped at level 3:
+
+- **Reach** — `DASH_RANGE_BONUS = +30%` burst speed per level (longer dash).
+- **Trail** — leaves a short-lived damaging zone (`DASH_TRAIL_DPS`,
+  `DASH_TRAIL_DURATION`) along your dash path. More levels = higher trail DPS.
+  The trail damages *enemies* and credits your DPS meter.
+- **Cooldown** — `DASH_CD_REDUCTION = -15%` cooldown per level (floored at
+  `DASH_CD_MIN = 0.6×`). More dashes, more i-frames.
 
 ## Swap (hold Space) — the co-op signature
 
@@ -68,8 +87,10 @@ The 9 weapons (`src/sim/weapons.ts`):
 | `homing` | Seeker Missile | Twin missiles that steer to targets. |
 | `mine` | Spore Mine | Drops a proximity mine that explodes in an AoE. |
 
-Each has a `range` used for targeting *and* drawn as a faint circle around your
-player (so you can see what your longest weapon can reach).
+Each has a `range` (max reach, drawn as a faint outer ring) and an
+`activationRange` (where it actually acquires a target, drawn as a slightly
+brighter inner ring) — plus a distinct projectile `shape` (circle, triangle,
+square, diamond, star, rect, spark) so you can tell your fire apart at a glance.
 
 ## Shield (defensive)
 
@@ -87,10 +108,27 @@ player (so you can see what your longest weapon can reach).
 - Options are one of:
   - **New weapon** (if you have a free slot),
   - **Upgrade** an existing weapon (if not maxed),
+  - **Dash upgrade** — Reach / Trail / Cooldown (Stage 3),
+  - **Cursed** — a strong weapon boost (+2 bonus levels) bundled with a
+    run-long **curse** (see below),
   - **Mend** (heal ~30% HP) — appears as a fallback when your loadout is full,
   - **Aegis** (shield top-up) — sometimes offered when you're below max shield.
-- Pick one → it's applied on the server and the box despawns.
+- Pick one → it's applied on the server (`applyPickOption`) and the box despawns.
 - One box per player at a time; a box claimed by you can't be stolen.
+
+## Cursed upgrades (risk/reward)
+
+A cursed option trades a run-long negative modifier for a big positive now. The
+curse is per-player but affects the shared world (active if *any* player has it).
+
+| Curse | Effect |
+|-------|--------|
+| **Swarm** | +40% enemy spawn rate (`CURSE_SPAWN_MULT`). |
+| **Haste** | +25% enemy speed (`CURSE_ENEMY_SPEED_MULT`). |
+| **Frailty** | Max HP cut to 75% (`CURSE_MAX_HP_MULT`), applied immediately. |
+| **Drift** | The safe zone scrolls 50% faster (`CURSE_SCROLL_SPEED_MULT`). |
+
+Active curses show as red tags on your HUD stat block.
 
 ## Health packs
 
@@ -113,7 +151,9 @@ The React HUD (`src/ui/Hud.tsx`) shows, per player:
 
 - HP bar and **shield bar** (sits above HP),
 - Mana bar + Swap charge progress,
-- **Dash cooldown meter** (full = ready),
+- **Dash cooldown meter** (full = ready; scaled by your cooldown level),
+- **Dash upgrade levels** (Reach / Trail / Cooldown tags),
+- **Active curses** (red tags),
 - **DPS** (rolling 5s window),
 - Revive progress when relevant,
 - The active weapon loadout.
